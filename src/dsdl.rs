@@ -1,10 +1,11 @@
 //! This module contains types associated with specific Dronecan messages.
 
+use crate::{f16, protocol::ConfigCommon, CanError, MsgType, PAYLOAD_SIZE_NODE_STATUS};
 use bitvec::prelude::*;
-#[cfg(feature = "hal")]
-use defmt::println;
+use heapless::{String, Vec};
 
-use crate::{protocol::ConfigCommon, CanError, MsgType, PAYLOAD_SIZE_NODE_STATUS};
+#[cfg(feature = "defmt")]
+use defmt::*;
 
 // pub const PARAM_NAME_NODE_ID: [u8; 14] = *b"uavcan.node_id";
 // pub const PARAM_NAME_NODE_ID: &'static [u8] = "uavcan.node_id".as_bytes();
@@ -35,7 +36,8 @@ const MAX_GET_SET_NAME_LEN: usize = 50; // not overal max; max we use to keep bu
 const VALUE_STRING_LEN_SIZE: usize = 8; // round_up(log2(128+1));
 
 /// Reference: https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/341.NodeStatus.uavcan
-#[derive(Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum NodeHealth {
     Ok = 0,
@@ -44,8 +46,21 @@ pub enum NodeHealth {
     Critical = 3,
 }
 
+impl From<u8> for NodeHealth {
+    fn from(val: u8) -> Self {
+        match val {
+            0 => NodeHealth::Ok,
+            1 => NodeHealth::Warning,
+            2 => NodeHealth::Error,
+            3 => NodeHealth::Critical,
+            _ => panic!(),
+        }
+    }
+}
+
 /// Reference: https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/341.NodeStatus.uavcan
-#[derive(Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum NodeMode {
     Operational = 0,
@@ -55,7 +70,21 @@ pub enum NodeMode {
     Offline = 7,
 }
 
+impl From<u8> for NodeMode {
+    fn from(val: u8) -> Self {
+        match val {
+            0 => NodeMode::Operational,
+            1 => NodeMode::Initialization,
+            2 => NodeMode::Maintenance,
+            3 => NodeMode::SoftwareUpdate,
+            _ => panic!(),
+        }
+    }
+}
+
 /// Broadcast periodically, and sent as part of the Node Status message.
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeStatus {
     pub uptime_sec: u32,
     pub health: NodeHealth,
@@ -77,10 +106,92 @@ impl NodeStatus {
 
         result
     }
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        let bits = buf.view_bits::<Msb0>();
+        let uptime_sec = bits[0..32].load_le();
+        let health = NodeHealth::from(bits[33..40].load::<u8>());
+        let mode = NodeMode::from(bits[41..48].load::<u8>());
+        let vendor_specific_status_code = bits[84..100].load_le();
+        Self {
+            uptime_sec,
+            health,
+            mode,
+            vendor_specific_status_code,
+        }
+    }
+}
+
+/// Maximum size of the Vec for GetNodeInfoResponse
+pub const UAVCAN_PROTOCOL_GET_NODE_INFO_RESPONSE_MAX_SIZE: usize = 377;
+
+/// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/GetNodeInfoResponse.uavcan
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+pub struct GetNodeInfoResponse {
+    pub node_status: NodeStatus,
+    pub sw_version: SoftwareVersion,
+    pub hw_version: HardwareVersion,
+    pub name: String<80>, // max length of 80
+}
+
+impl GetNodeInfoResponse {
+    /// convert `GetNodeInfoResponse` to bytes
+    pub fn to_bytes(&self) -> Vec<u8, UAVCAN_PROTOCOL_GET_NODE_INFO_RESPONSE_MAX_SIZE> {
+        let mut buf = Vec::new();
+
+        // copy node status
+        let ns = self.node_status.to_bytes();
+        buf.clone_from_slice(&ns);
+        let mut start = ns.len();
+
+        // copy sw version
+        let sw = self.sw_version.to_bytes();
+        buf[start..].clone_from_slice(&sw);
+        start += sw.len();
+
+        // copy hw version
+        let hw = self.hw_version.to_bytes();
+        buf[start..].clone_from_slice(&hw);
+        start += hw.len();
+
+        if self.name.len() > 80 {
+            panic!();
+        }
+        buf.push(self.name.len() as u8).ok();
+        start += 1;
+        buf[start..].clone_from_slice(self.name.as_bytes());
+        buf
+    }
+
+    /// return `GetNodeInfoResponse` from payload data
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        let mut start = 0;
+        let node_status = NodeStatus::from_bytes(&buf[start..PAYLOAD_SIZE_NODE_STATUS]);
+        start = PAYLOAD_SIZE_NODE_STATUS;
+        let sw_version =
+            SoftwareVersion::from_bytes(&buf[start..start + PAYLOAD_SIZE_SOFTWARE_VERSION]);
+        start += PAYLOAD_SIZE_SOFTWARE_VERSION;
+        let hw_version =
+            HardwareVersion::from_bytes(&buf[start..start + PAYLOAD_SIZE_HARDWARE_VERSION]);
+        start += PAYLOAD_SIZE_HARDWARE_VERSION;
+        let name_len = buf[start];
+        start += 1;
+        let mut v = Vec::new();
+        v.extend_from_slice(&buf[start..start + name_len as usize])
+            .ok();
+        let name = String::from_utf8(v).unwrap();
+        Self {
+            node_status,
+            sw_version,
+            hw_version,
+            name,
+        }
+    }
 }
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/param/10.ExecuteOpcode.uavcan
-#[derive(Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum OpcodeType {
     Save = 0,
@@ -120,7 +231,8 @@ impl ExecuteOpcode {
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/param/NumericValue.uavcan
 /// `uavcan.protocol.param.NumericValue`
 /// 2-bit tag.
-#[derive(Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Clone, Copy)]
 pub enum NumericValue {
     Empty,
     Integer(i64),
@@ -166,7 +278,8 @@ impl NumericValue {
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/param/Value.uavcan
 /// `uavcan.protocol.param.Value`
 /// 3-bit tag with 5-bit prefix for alignment.
-#[derive(Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Clone, Copy)]
 pub enum Value<'a> {
     Empty,
     Integer(i64),
@@ -262,7 +375,7 @@ impl<'a> Value<'a> {
             4 => {
                 // todo: Handle non-FD mode that uses TCO
                 let current_i = val_start_i + VALUE_STRING_LEN_SIZE;
-                let str_len: u8 = bits[val_start_i..current_i].load_le();
+                let _str_len: u8 = bits[val_start_i..current_i].load_le();
 
                 // todo: WTH?
                 (Self::Integer(69), val_start_i + 64)
@@ -393,7 +506,7 @@ impl<'a> GetSetResponse<'a> {
     }
 
     pub fn from_bytes(buf: &[u8]) -> Result<Self, CanError> {
-        let bits = buf.view_bits::<Msb0>();
+        let _bits = buf.view_bits::<Msb0>();
 
         unimplemented!() // todo: You just need to work thorugh it like with related.
                          //
@@ -448,10 +561,14 @@ impl<'a> GetSetResponse<'a> {
     }
 }
 
+pub const PAYLOAD_SIZE_HARDWARE_VERSION: usize = 19;
+
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/HardwareVersion.uavcan
 /// Generic hardware version information.
 /// These values should remain unchanged for the device's lifetime.
 // pub struct HardwareVersion<'a> {
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HardwareVersion {
     pub major: u8,
     pub minor: u8,
@@ -465,8 +582,8 @@ pub struct HardwareVersion {
 }
 
 impl HardwareVersion {
-    pub fn to_bytes(&self) -> [u8; 19] {
-        let mut buf = [0; 19];
+    pub fn to_bytes(&self) -> [u8; PAYLOAD_SIZE_HARDWARE_VERSION] {
+        let mut buf = [0; PAYLOAD_SIZE_HARDWARE_VERSION];
 
         buf[0] = self.major;
         buf[1] = self.minor;
@@ -475,10 +592,23 @@ impl HardwareVersion {
         buf[18] = 0;
         buf
     }
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        let mut unique_id = [0; 16];
+        unique_id.copy_from_slice(&buf[2..18]);
+        Self {
+            major: buf[0],
+            minor: buf[1],
+            unique_id,
+        }
+    }
 }
+
+pub const PAYLOAD_SIZE_SOFTWARE_VERSION: usize = 15;
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/SoftwareVersion.uavcan
 /// Generic software version information.
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SoftwareVersion {
     pub major: u8,
     pub minor: u8,
@@ -493,7 +623,7 @@ pub struct SoftwareVersion {
 }
 
 impl SoftwareVersion {
-    pub fn to_bytes(&self) -> [u8; 15] {
+    pub fn to_bytes(&self) -> [u8; PAYLOAD_SIZE_SOFTWARE_VERSION] {
         let mut result = [0; 15];
 
         result[0] = self.major;
@@ -504,10 +634,24 @@ impl SoftwareVersion {
 
         result
     }
+
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        let bits = buf.view_bits::<Msb0>();
+        let vcs_commit = bits[24..56].load_le();
+        let image_crc = bits[57..114].load_le();
+        Self {
+            major: buf[0],
+            minor: buf[1],
+            optional_field_flags: buf[2],
+            vcs_commit,
+            image_crc,
+        }
+    }
 }
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/DataTypeKind.uavcan
-#[derive(Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum DataTypeKind {
     Service = 0,
@@ -621,70 +765,324 @@ pub fn make_getset_response_common<'a>(
                 name_len: text.len(),
             })
         }
-        3 => {
-            let text = PARAM_NAME_BITRATE;
-            name[0..text.len()].copy_from_slice(text);
+        // 3 => {
+        //     let text = PARAM_NAME_BITRATE;
+        //     name[0..text.len()].copy_from_slice(text);
 
-            Some(GetSetResponse {
-                value: Value::Integer(config.can_bitrate as i64),
-                default_value: Value::Integer(cfg_default.can_bitrate as i64),
-                max_value: NumericValue::Integer(6),
-                min_value: NumericValue::Integer(0),
-                name,
-                name_len: text.len(),
-            })
-        }
+        //     Some(GetSetResponse {
+        //         value: Value::Integer(config.can_bitrate as i64),
+        //         default_value: Value::Integer(cfg_default.can_bitrate as i64),
+        //         max_value: NumericValue::Integer(6),
+        //         min_value: NumericValue::Integer(0),
+        //         name,
+        //         name_len: text.len(),
+        //     })
+        // }
         _ => None,
     }
 }
 
-#[derive(Default)]
-/// https://www.expresslrs.org/3.0/info/signal-health/
-/// Currently AnyLeaf only.
-pub struct LinkStats {
-    // /// Timestamp these stats were recorded. (TBD format; processed locally; not part of packet from tx).
-    // pub timestamp: u32,
-    /// Uplink - received signal strength antenna 1 (RSSI). RSSI dBm as reported by the RX. Values
-    /// vary depending on mode, antenna quality, output power and distance. Ranges from -128 to 0.
-    pub uplink_rssi_1: u8,
-    /// Uplink - received signal strength antenna 2 (RSSI). Second antenna RSSI, used in diversity mode
-    /// (Same range as rssi_1)
-    pub uplink_rssi_2: u8,
-    /// Uplink - link quality (valid packets). The number of successful packets out of the last
-    /// 100 from TX → RX
-    pub uplink_link_quality: u8,
-    /// Uplink - signal-to-noise ratio. SNR reported by the RX. Value varies mostly by radio chip
-    /// and gets lower with distance (once the agc hits its limit)
-    pub uplink_snr: u8,
-    /// Active antenna for diversity RX (0 - 1)
-    pub active_antenna: u8,
-    pub rf_mode: u8,
-    /// Uplink - transmitting power. See the `ElrsTxPower` enum and its docs for details.
-    pub uplink_tx_power: u8,
-    /// Downlink - received signal strength (RSSI). RSSI dBm of telemetry packets received by TX.
-    pub downlink_rssi: u8,
-    /// Downlink - link quality (valid packets). An LQ indicator of telemetry packets received RX → TX
-    /// (0 - 100)
-    pub downlink_link_quality: u8,
-    /// Downlink - signal-to-noise ratio. SNR reported by the TX for telemetry packets
-    pub downlink_snr: u8,
+/// Maximum size of the Vec for Covariance
+pub const UAVCAN_EQUIPMENT_AHRS_SOLUTION_COVARIANCE_MAX_SIZE: usize = 9;
+
+/// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/ahrs/1000.Solution.uavcan
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+pub struct Covariance {
+    pub data: Vec<f32, UAVCAN_EQUIPMENT_AHRS_SOLUTION_COVARIANCE_MAX_SIZE>,
 }
 
-impl LinkStats {
-    pub fn to_bytes(&self) -> [u8; MsgType::LinkStats.payload_size() as usize] {
-        let mut result = [0; MsgType::LinkStats.payload_size() as usize];
+impl Default for Covariance {
+    fn default() -> Self {
+        Self { data: Vec::new() }
+    }
+}
 
-        result[0] = self.uplink_rssi_1;
-        result[1] = self.uplink_rssi_2;
-        result[2] = self.uplink_link_quality;
-        result[3] = self.uplink_snr as u8;
-        result[4] = self.active_antenna;
-        result[5] = self.rf_mode;
-        result[6] = self.uplink_tx_power;
-        result[7] = self.downlink_rssi;
-        result[8] = self.downlink_link_quality;
-        result[9] = self.downlink_snr as u8;
+/// Maximum size of the Vec for AhrsSolution
+pub const UAVCAN_EQUIPMENT_AHRS_SOLUTION_MAX_SIZE: usize = 84;
 
-        result
+/// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/ahrs/1000.Solution.uavcan
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+pub struct AhrsSolution {
+    pub uavcan_timestamp: u64,
+    pub orientation_xyzw: [f32; 4],
+    pub orientation_covariance: Covariance,
+    pub angular_velocity: [f32; 3],
+    pub angular_velocity_covariance: Covariance,
+    pub linear_acceleration: [f32; 3],
+    pub linear_acceleration_covariance: Covariance,
+}
+
+impl AhrsSolution {
+    /// convert `AhrsSolution` to bytes
+    pub fn to_bytes(&self, buf: &mut Vec<u8, UAVCAN_EQUIPMENT_AHRS_SOLUTION_MAX_SIZE>) {
+        // fill the buffer with zero's to the max length
+        buf.resize_default(UAVCAN_EQUIPMENT_AHRS_SOLUTION_MAX_SIZE)
+            .ok();
+
+        // copy the timestamp
+        buf[..7].clone_from_slice(&self.uavcan_timestamp.to_le_bytes()[0..7]);
+
+        let bits = buf.view_bits_mut::<Msb0>();
+
+        let bit_index = 56; // bits
+
+        let bit_index = self.orientation_xyzw.iter().fold(bit_index, |i, x| {
+            let v = u16::from_le_bytes(f16::from_f32(*x).to_le_bytes());
+            bits[i..i + 16].store_le(v);
+            i + 16
+        });
+
+        // 4-bit pad and len covar
+        bits[bit_index..bit_index + 4].store_le(0);
+        let bit_index = bit_index + 4;
+        bits[bit_index..bit_index + 4].store_le(self.orientation_covariance.data.len());
+        let bit_index = bit_index + 4;
+        let bit_index = self
+            .orientation_covariance
+            .data
+            .iter()
+            .fold(bit_index, |i, x| {
+                let v = u16::from_le_bytes(f16::from_f32(*x).to_le_bytes());
+                bits[i..i + 16].store_le(v);
+                i + 16
+            });
+
+        let bit_index = self.angular_velocity.iter().fold(bit_index, |i, x| {
+            let v = u16::from_le_bytes(f16::from_f32(*x).to_le_bytes());
+            bits[i..i + 16].store_le(v);
+            i + 16
+        });
+
+        // 4-bit pad and len covar
+        bits[bit_index..bit_index + 4].store_le(0);
+        let bit_index = bit_index + 4;
+        bits[bit_index..bit_index + 4].store_le(self.angular_velocity_covariance.data.len());
+        let bit_index = bit_index + 4;
+        let bit_index = self
+            .angular_velocity_covariance
+            .data
+            .iter()
+            .fold(bit_index, |i, x| {
+                let v = u16::from_le_bytes(f16::from_f32(*x).to_le_bytes());
+                bits[i..i + 16].store_le(v);
+                i + 16
+            });
+
+        let bit_index = self.linear_acceleration.iter().fold(bit_index, |i, x| {
+            let v = u16::from_le_bytes(f16::from_f32(*x).to_le_bytes());
+            bits[i..i + 16].store_le(v);
+            i + 16
+        });
+
+        // 4-bit pad and len covar
+        bits[bit_index..bit_index + 4].store_le(0);
+        let bit_index = bit_index + 4;
+        bits[bit_index..bit_index + 4].store_le(self.linear_acceleration_covariance.data.len());
+        let bit_index = bit_index + 4;
+        let bit_index = self
+            .linear_acceleration_covariance
+            .data
+            .iter()
+            .fold(bit_index, |i, x| {
+                let v = u16::from_le_bytes(f16::from_f32(*x).to_le_bytes());
+                bits[i..i + 16].store_le(v);
+                i + 16
+            });
+
+        // resize buf back to actual length
+        buf.truncate(bit_index / 8);
+    }
+
+    /// return AhrsSolution from payload data
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        // timestamp is stored as 7 bytes, the final byte for a u64 in le order is assumed to be zero
+        let mut tsbuf: [u8; 8] = [0; 8];
+        tsbuf[..7].clone_from_slice(&buf[..7]);
+        let uavcan_timestamp = u64::from_le_bytes(tsbuf);
+        let bits = buf.view_bits::<Msb0>();
+
+        let mut bit_index = 56;
+
+        // load orientation
+        let mut orientation_xyzw = [0_f32; 4];
+        let (_head, rest) = bits.split_at(bit_index);
+        for (slot, f) in rest.chunks(16).zip(orientation_xyzw.iter_mut()) {
+            let v: u16 = slot.load_le();
+            let sf = f16 { bits: v };
+            *f = sf.to_f32();
+        }
+        bit_index += 4 * 16;
+
+        // covariance
+        let (_head, rest) = bits.split_at(bit_index);
+        let mut itr = rest.chunks(4);
+        // skip pad
+        itr.next();
+        let len = itr.next().unwrap().load_le();
+        bit_index += 8;
+        let mut orientation_covariance = Covariance { data: Vec::new() };
+        if len != 0 {
+            let (_head, rest) = bits.split_at(bit_index);
+            for (i, slot) in rest.chunks(16).enumerate() {
+                if i == len {
+                    break;
+                }
+                let v: u16 = slot.load_le();
+                let sf = f16 { bits: v };
+                orientation_covariance.data.push(sf.to_f32()).ok();
+            }
+        }
+        bit_index += 16 * len;
+
+        // load angular velocity
+        let mut angular_velocity = [0_f32; 3];
+        let (_head, rest) = bits.split_at(bit_index);
+        for (slot, f) in rest.chunks(16).zip(angular_velocity.iter_mut()) {
+            let v: u16 = slot.load_le();
+            let sf = f16 { bits: v };
+            *f = sf.to_f32();
+        }
+        bit_index += 3 * 16;
+
+        // covariance
+        let (_head, rest) = bits.split_at(bit_index);
+        let mut itr = rest.chunks(4);
+        // skip pad
+        itr.next();
+        let len = itr.next().unwrap().load_le();
+        bit_index += 8;
+        let mut angular_velocity_covariance = Covariance { data: Vec::new() };
+        if len != 0 {
+            let (_head, rest) = bits.split_at(bit_index);
+            for (i, slot) in rest.chunks(16).enumerate() {
+                if i == len {
+                    break;
+                }
+                let v: u16 = slot.load_le();
+                let sf = f16 { bits: v };
+                angular_velocity_covariance.data.push(sf.to_f32()).ok();
+            }
+        }
+        bit_index += 16 * len;
+
+        // load linear acceleration
+        let mut linear_acceleration = [0_f32; 3];
+        let (_head, rest) = bits.split_at(bit_index);
+        for (slot, f) in rest.chunks(16).zip(linear_acceleration.iter_mut()) {
+            let v: u16 = slot.load_le();
+            let sf = f16 { bits: v };
+            *f = sf.to_f32();
+        }
+        bit_index += 3 * 16;
+
+        // covariance
+        let (_head, rest) = bits.split_at(bit_index);
+        let mut itr = rest.chunks(4);
+        // skip pad
+        itr.next();
+        let len = itr.next().unwrap().load_le();
+        bit_index += 8;
+        let mut linear_acceleration_covariance = Covariance { data: Vec::new() };
+        if len != 0 {
+            let (_head, rest) = bits.split_at(bit_index);
+            for (i, slot) in rest.chunks(16).enumerate() {
+                if i == len {
+                    break;
+                }
+                let v: u16 = slot.load_le();
+                let sf = f16 { bits: v };
+                linear_acceleration_covariance.data.push(sf.to_f32()).ok();
+            }
+        }
+
+        Self {
+            uavcan_timestamp,
+            orientation_xyzw,
+            orientation_covariance,
+            angular_velocity,
+            angular_velocity_covariance,
+            linear_acceleration,
+            linear_acceleration_covariance,
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_ahrs_solution_no_covar() {
+        let sol1 = AhrsSolution {
+            uavcan_timestamp: 1,
+            orientation_xyzw: [0.0, 1.0, 2.0, 3.0],
+            orientation_covariance: Covariance::default(),
+            angular_velocity: [0.0, 1.0, 2.0],
+            angular_velocity_covariance: Covariance::default(),
+            linear_acceleration: [0.0, 1.0, 2.0],
+            linear_acceleration_covariance: Covariance::default(),
+        };
+        let mut sol1_buf = Vec::new();
+        sol1.to_bytes(&mut sol1_buf);
+        assert_eq!(sol1_buf.len(), 30);
+        let sol2 = AhrsSolution::from_bytes(sol1_buf.as_slice());
+        assert_eq!(sol2, sol1);
+    }
+
+    #[test]
+    fn test_ahrs_solution_covar() {
+        let sol1 = AhrsSolution {
+            uavcan_timestamp: 1,
+            orientation_xyzw: [0.0, 1.0, 2.0, 3.0],
+            orientation_covariance: Covariance {
+                data: Vec::from_slice(&[0.0, 1.0, 2.0]).unwrap(),
+            },
+            angular_velocity: [0.0, 1.0, 2.0],
+            angular_velocity_covariance: Covariance {
+                data: Vec::from_slice(&[0.0, 1.0, 2.0]).unwrap(),
+            },
+            linear_acceleration: [0.0, 1.0, 2.0],
+            linear_acceleration_covariance: Covariance {
+                data: Vec::from_slice(&[0.0, 1.0, 2.0]).unwrap(),
+            },
+        };
+        let mut sol1_buf = Vec::new();
+        sol1.to_bytes(&mut sol1_buf);
+        assert_eq!(sol1_buf.len(), 48);
+        let sol2 = AhrsSolution::from_bytes(sol1_buf.as_slice());
+        assert_eq!(sol2, sol1);
+    }
+
+    #[test]
+    fn test_get_node_info_response() {
+        let sol1 = GetNodeInfoResponse {
+            node_status: NodeStatus {
+                uptime_sec: 1,
+                health: NodeHealth::Warning,
+                mode: NodeMode::Offline,
+                vendor_specific_status_code: 22344,
+            },
+            sw_version: SoftwareVersion {
+                major: 1,
+                minor: 1,
+                optional_field_flags: 0x3,
+                vcs_commit: 2344,
+                image_crc: u64::MAX,
+            },
+            hw_version: HardwareVersion {
+                major: 2,
+                minor: 2,
+                unique_id: [
+                    0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf, 0x10,
+                ],
+            },
+            name: String::from(b"test_get_node_info_response"),
+        };
+        let gnir_buf = sol1.to_bytes();
+        assert_eq!(gnir_buf.len(), 48);
+        let sol2 = GetNodeInfoResponse::from_bytes(gnir_buf.as_slice());
+        assert_eq!(sol2, sol1);
     }
 }

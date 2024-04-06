@@ -1,26 +1,9 @@
 //! This module contains code related to broadcasting messages over CAN.
-//! It is hard-coded to work with our HAL.
-
-use core::{
-    convert::Infallible,
-    sync::atomic::{AtomicUsize, Ordering},
-};
-
-use bitvec::prelude::*;
-use defmt::println;
-use fdcan::{
-    frame::{FrameFormat, RxFrameInfo, TxFrameHeader},
-    id::{ExtendedId, Id},
-    FdCan, Mailbox, NormalOperationMode, ReceiveOverrun,
-};
-use num_enum::TryFromPrimitive;
-use packed_struct::PackedStruct;
-use stm32_hal2::can::Can;
 
 use crate::{
     crc::TransferCrc,
     dsdl::{
-        GetSetResponse, HardwareVersion, IdAllocationData, LinkStats, NodeHealth, NodeMode,
+        AhrsSolution, GetSetResponse, HardwareVersion, IdAllocationData, NodeHealth, NodeMode,
         NodeStatus, SoftwareVersion,
     },
     f16, find_tail_byte_index,
@@ -30,51 +13,18 @@ use crate::{
     protocol::{CanId, FrameType, RequestResponse, ServiceData, TransferComponent},
     CanError,
 };
-
-type Can_ = FdCan<Can, NormalOperationMode>;
+use bitvec::prelude::*;
+use embedded_can;
+use heapless::{Deque, Entry, FnvIndexMap, Vec};
+use log::*;
+use packed_struct::PackedStruct;
 
 // Note: These are only capable of handling one message at a time. This is especially notable
 // for reception.
 static mut MULTI_FRAME_BUFS_TX: [[u8; 64]; 20] = [[0; 64]; 20];
-// static mut MULTI_FRAME_BUFS_TX_FD: [[u8; 64]; 2] = [[0; 64]; 2];
-// static mut MULTI_FRAME_BUFS_TX_LEGACY: [[u8; 8]; 20] = [[0; 8]; 20];
 
-pub(crate) const DATA_FRAME_MAX_LEN_FD: u8 = 64;
-pub(crate) const DATA_FRAME_MAX_LEN_LEGACY: u8 = 8;
-
-pub static TRANSFER_ID_ID_ALLOCATION: AtomicUsize = AtomicUsize::new(0);
-pub static TRANSFER_ID_NODE_INFO: AtomicUsize = AtomicUsize::new(0);
-pub static TRANSFER_ID_NODE_STATUS: AtomicUsize = AtomicUsize::new(0);
-pub static TRANSFER_ID_GLOBAL_TIME_SYNC: AtomicUsize = AtomicUsize::new(0);
-pub static TRANSFER_ID_TRANSPORT_STATS: AtomicUsize = AtomicUsize::new(0);
-pub static TRANSFER_ID_PANIC: AtomicUsize = AtomicUsize::new(0);
-pub static TRANSFER_ID_RESTART: AtomicUsize = AtomicUsize::new(0);
-pub static TRANSFER_ID_GET_SET: AtomicUsize = AtomicUsize::new(0);
-
-pub static TRANSFER_ID_AHRS_SOLUTION: AtomicUsize = AtomicUsize::new(0);
-pub static TRANSFER_ID_MAGNETIC_FIELD_STRENGTH2: AtomicUsize = AtomicUsize::new(0);
-pub static TRANSFER_ID_RAW_IMU: AtomicUsize = AtomicUsize::new(0);
-pub static TRANSFER_ID_AIR_DATA: AtomicUsize = AtomicUsize::new(0);
-pub static TRANSFER_ID_STATIC_PRESSURE: AtomicUsize = AtomicUsize::new(0);
-pub static TRANSFER_ID_STATIC_TEMPERATURE: AtomicUsize = AtomicUsize::new(0);
-pub static TRANSFER_ID_GNSS_AUX: AtomicUsize = AtomicUsize::new(0);
-pub static TRANSFER_ID_FIX2: AtomicUsize = AtomicUsize::new(0);
-pub static TRANSFER_ID_GLOBAL_NAVIGATION_SOLUTION: AtomicUsize = AtomicUsize::new(0);
-pub static TRANSFER_ID_RC_INPUT: AtomicUsize = AtomicUsize::new(0);
-pub static TRANSFER_ID_ACTUATOR_ARRAY_COMMAND: AtomicUsize = AtomicUsize::new(0);
-
-pub static TRANSFER_ID_CH_DATA: AtomicUsize = AtomicUsize::new(0);
-pub static TRANSFER_ID_LINK_STATS: AtomicUsize = AtomicUsize::new(0);
-pub static TRANSFER_ID_TELEMETRY: AtomicUsize = AtomicUsize::new(0);
-pub static TRANSFER_ID_ARDUPILOT_GNSS_STATUS: AtomicUsize = AtomicUsize::new(0);
-pub static TRANSFER_ID_POWER_STATS: AtomicUsize = AtomicUsize::new(0);
-pub static TRANSFER_ID_CIRCUIT_STATUS: AtomicUsize = AtomicUsize::new(0);
-pub static TRANSFER_ID_POWER_SUPPLY_STATUS: AtomicUsize = AtomicUsize::new(0);
-
-// todo: Impl these Arudpilot-specific types:
-// https://github.com/dronecan/DSDL/tree/master/ardupilot/gnss
-
-pub static TRANSFER_ID_ACK: AtomicUsize = AtomicUsize::new(0);
+pub(crate) const DATA_FRAME_MAX_LEN_FD: usize = 64;
+pub(crate) const DATA_FRAME_MAX_LEN_LEGACY: usize = 8;
 
 // Static buffers, to ensure they live long enough through transmission. Note; This all include room for a tail byte,
 // based on payload len. We also assume no `certificate_of_authority` for hardware size.
@@ -92,9 +42,8 @@ static mut BUF_TRANSPORT_STATS: [u8; 20] = [0; 20];
 // Also long enough to support padding to the tail byte of 32-len for a 2-frame FD transfer.
 static mut BUF_GET_SET: [u8; 90] = [0; 90];
 
-static mut BUF_AHRS_SOLUTION: [u8; 48] = [0; 48]; // Note: No covariance.
-                                                  // static mut BUF_MAGNETIC_FIELD_STRENGTH2: [u8; 8] = [0; 8]; // Note: No covariance.
-                                                  // Potentially need size 12 for mag strength in FD mode, even with no cov.
+// static mut BUF_MAGNETIC_FIELD_STRENGTH2: [u8; 8] = [0; 8]; // Note: No covariance.
+// Potentially need size 12 for mag strength in FD mode, even with no cov.
 static mut BUF_MAGNETIC_FIELD_STRENGTH2: [u8; 12] = [0; 12]; // Note: No covariance.
 static mut BUF_RAW_IMU: [u8; 64] = [0; 64]; // Note: No covariance.
 static mut BUF_PRESSURE: [u8; 8] = [0; 8];
@@ -108,12 +57,7 @@ const ACTUATOR_COMMAND_SIZE: usize = 4;
 static mut BUF_ACTUATOR_ARRAY_COMMAND: [u8; ACTUATOR_COMMAND_SIZE * 4] =
     [0; ACTUATOR_COMMAND_SIZE * 4];
 
-// This buffer accomodates up to 16 12-bit channels. (224 bits or 28 bytes)
-static mut BUF_RC_INPUT: [u8; 32] = [0; 32];
-static mut BUF_LINK_STATS: [u8; 12] = [0; 12];
-static mut BUF_TELEMETRY: [u8; 64] = [0; 64];
 static mut BUF_ARDUPILOT_GNSS_STATUS: [u8; 8] = [0; 8];
-static mut BUF_POWER_STATS: [u8; 48] = [0; 48];
 static mut BUF_CIRCUIT_STATUS: [u8; 8] = [0; 8];
 static mut BUF_POWER_SUPPLY_STATUS: [u8; 8] = [0; 8];
 
@@ -121,270 +65,264 @@ static mut BUF_POWER_SUPPLY_STATUS: [u8; 8] = [0; 8];
 pub const NODE_ID_MIN_VALUE: u8 = 1;
 pub const NODE_ID_MAX_VALUE: u8 = 127;
 
-use stm32_hal2::pac;
+/// The key for a map entry to `TransferDesc`
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum TransferDescKey {
+    /// datatype, source_id
+    Message(u16, u8),
+    /// datatype
+    MessageAnon(u16),
+    /// datatype, source_id, dest_id
+    Service(u16, u8, u8),
+}
 
-/// Write out packet to the CAN peripheral.
-fn can_send(
-    can: &mut Can_,
-    can_id: u32,
-    frame_data: &[u8],
-    frame_data_len: u8,
-    fd_mode: bool,
-) -> Result<(), CanError> {
-    let max_frame_len = if fd_mode {
-        DATA_FRAME_MAX_LEN_FD
-    } else {
-        DATA_FRAME_MAX_LEN_LEGACY
-    };
+/// The `TransferDesc` contains state for a given transfer
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct TransferDesc {
+    transfer_id: u8,
+    last_txfer: u64,
+}
 
-    if frame_data_len > max_frame_len {
-        return Err(CanError::FrameSize);
+impl TransferDesc {
+    /// Get the current transfer_id
+    pub fn transfer_id(&mut self) -> u8 {
+        self.transfer_id
     }
-
-    let frame_format = if fd_mode {
-        FrameFormat::Fdcan
-    } else {
-        FrameFormat::Standard
-    };
-
-    let id = Id::Extended(ExtendedId::new(can_id).unwrap());
-
-    let frame_header = TxFrameHeader {
-        len: frame_data_len,
-        frame_format,
-        id,
-        bit_rate_switching: true,
-        marker: None,
-    };
-
-    // Some example codes:
-    // 1800: Good code, where no ESP is in place. Constant.
-
-    // No LEC.Idle. Last of 111 (no change). Thi is means all is well.
-
-    // 1896: Error + warning. No LEC. Doesn't hang.
-    // 1864: Warning only. No LEC. Doesn't hang.
-
-    // These cause a hang, and both have LEC: Bit0Error.
-    // "Bit0Error: During the transmission of a message (or acknowledge bit, or active error
-    // flag, or overload flag), the device wanted to send a dominant level (data or identifier bit logical
-    // value 0), but the monitored bus value was recessive."
-    // 2021 means idle. 1901 means synchronizing.
-    // Both have Error passive and Error warning status.
-    // 2021 means Bus off (!)
-    // Both have Data Last Error code of 111. (no change)
-
-    // 1901: // bad code, prior to hanging.
-    // 2021: // bad code, at hanging.
-
-    // These eventually hang.
-    // 616 has no Last Error code. 617 has Stuff Error. 618 has Form Error
-    // Rest same. Idle, EW + EP, DLEC = 001.
-
-    // 616:
-    // 617:
-    // 618:
-
-    // This wait appears to be required, pending handling using a queue in the callback.
-
-    let mut count: u16 = 0;
-    while !can.is_transmitter_idle() {
-        count += 1;
-        const TIMEOUT_COUNT: u16 = 50_000; // todo: What should this be?
-
-        if count >= TIMEOUT_COUNT {
-            println!("\nCAN loop timeout:");
-            unsafe {
-                let regs = &(*pac::FDCAN1::ptr());
-                println!("SR: {}", regs.psr.read().bits());
-            }
-
-            return Err(CanError::Hardware);
-        }
-    }
-
-    match can.transmit_preserve(frame_header, frame_data, &mut message_pending_handler) {
-        Ok(_) => Ok(()),
-        Err(_e) => Err(CanError::Hardware),
+    /// Get the current transfer_id, then increment it
+    ///
+    /// transfer_id's are 5 bits in length and roll over when
+    pub fn transfer_id_then_incr(&mut self) -> u8 {
+        let id = self.transfer_id;
+        self.transfer_id += 1;
+        self.transfer_id &= 0b1_1111;
+        id
     }
 }
 
-/// Handles splitting a payload into multiple frames, including DroneCAN and Cyphal requirements,
-/// eg CRC and data type signature.
-fn send_multiple_frames(
-    can: &mut Can_,
-    payload: &[u8],
-    payload_len: u16,
-    can_id: u32,
-    transfer_id: u8,
-    fd_mode: bool,
-    base_crc: u16,
-) -> Result<(), CanError> {
-    let frame_payload_len = if fd_mode {
-        DATA_FRAME_MAX_LEN_FD as usize
-    } else {
-        DATA_FRAME_MAX_LEN_LEGACY as usize
-    };
+/// Broadcast struct for Uavcan on CAN interface
+pub struct Uavcan<CAN, FRAME>
+where
+    CAN: embedded_can::blocking::Can<Frame = FRAME>,
+    //    FRAME: embedded_can::Frame,
+{
+    iface: Vec<CAN, 2>,
+    tx_queue: Deque<FRAME, 10>,
+    txf_map: FnvIndexMap<TransferDescKey, TransferDesc, 20>,
+}
 
-    let mut crc = TransferCrc::new(base_crc);
-    crc.add_payload(payload, payload_len as usize);
-
-    // We use slices of the FD buf, even for legacy frames, to keep code simple.
-    let bufs = unsafe { &mut MULTI_FRAME_BUFS_TX };
-
-    // See https://dronecan.github.io/Specification/4._CAN_bus_transport_layer/,
-    // "Multi-frame transfer" re requirements such as CRC and Toggle bit.
-    let mut component = TransferComponent::MultiStart;
-    let mut active_frame = 0;
-    // This tracks the index of the payload we sent in the previous frame.
-
-    // Populate the first frame. This is different from the others due to the CRC.
-    let mut tail_byte = make_tail_byte(TransferComponent::MultiStart, transfer_id);
-    let mut payload_len_this_frame = frame_payload_len - 3; // -3 for CRC and tail byte.
-
-    // Add 2 for the CRC.
-    let tail_byte_i = find_tail_byte_index(payload_len_this_frame as u8 + 2);
-
-    bufs[active_frame][..2].clone_from_slice(&crc.value.to_le_bytes());
-    bufs[active_frame][2..frame_payload_len - 1]
-        .clone_from_slice(&payload[..payload_len_this_frame]);
-    bufs[active_frame][tail_byte_i] = tail_byte.value();
-
-    can_send(
-        can,
-        can_id,
-        &bufs[active_frame][..frame_payload_len],
-        frame_payload_len as u8,
-        fd_mode,
-    )?;
-
-    let mut latest_i_sent = payload_len_this_frame - 1;
-
-    active_frame += 1;
-
-    // Populate subsequent frames.
-    while latest_i_sent < payload_len as usize - 1 {
-        let payload_i = latest_i_sent + 1;
-        if payload_i + frame_payload_len <= payload_len as usize {
-            // Not the last frame.
-            payload_len_this_frame = frame_payload_len - 1;
-            component = TransferComponent::MultiMid(tail_byte.toggle);
-        } else {
-            // Last frame.
-            payload_len_this_frame = payload_len as usize - payload_i;
-            component = TransferComponent::MultiEnd(tail_byte.toggle);
+impl<CAN, FRAME, FE> Uavcan<CAN, FRAME>
+where
+    CAN: embedded_can::blocking::Can<Frame = FRAME, Error = FE>,
+    FRAME: embedded_can::Frame,
+{
+    /// Write out all pending transmit frames to all interfaces
+    pub fn can_send(&mut self) -> Result<(), FE> {
+        loop {
+            if let Some(frame) = self.tx_queue.pop_front() {
+                for iface in self.iface.iter_mut() {
+                    iface.transmit(&frame)?;
+                }
+            } else {
+                break;
+            }
         }
+        Ok(())
+    }
 
-        tail_byte = make_tail_byte(component, transfer_id);
+    /// Handles splitting a payload into multiple frames
+    /// when it is larger than a single frame
+    fn queue_multiple_frames(
+        &mut self,
+        payload: &[u8],
+        can_id: u32,
+        transfer_id: u8,
+        fd_mode: bool,
+        base_crc: u16,
+    ) -> Result<(), CanError> {
+        let frame_payload_len = if fd_mode {
+            DATA_FRAME_MAX_LEN_FD as usize
+        } else {
+            DATA_FRAME_MAX_LEN_LEGACY as usize
+        };
 
-        bufs[active_frame][0..payload_len_this_frame]
-            .clone_from_slice(&payload[payload_i..payload_i + payload_len_this_frame]);
+        let id = embedded_can::Id::Extended(embedded_can::ExtendedId::new(can_id).unwrap());
 
-        let tail_byte_i = find_tail_byte_index(payload_len_this_frame as u8);
+        let mut crc = TransferCrc::new(base_crc);
+        crc.add_payload(payload, payload.len());
+
+        // We use slices of the FD buf, even for legacy frames, to keep code simple.
+        let bufs = unsafe { &mut MULTI_FRAME_BUFS_TX };
+
+        // See https://dronecan.github.io/Specification/4._CAN_bus_transport_layer/,
+        // "Multi-frame transfer" re requirements such as CRC and Toggle bit.
+        let mut component = TransferComponent::MultiStart;
+        let mut active_frame = 0;
+        // This tracks the index of the payload we sent in the previous frame.
+
+        // Populate the first frame. This is different from the others due to the CRC.
+        let mut tail_byte = make_tail_byte(component, transfer_id);
+        let mut payload_len_this_frame = DATA_FRAME_MAX_LEN_LEGACY - 3; // -3 for CRC and tail byte.
+
+        // Add 2 for the CRC.
+        let tail_byte_i = find_tail_byte_index(payload_len_this_frame as u8 + 2);
+
+        bufs[active_frame][..2].clone_from_slice(&crc.value.to_le_bytes());
+        bufs[active_frame][2..DATA_FRAME_MAX_LEN_LEGACY - 1]
+            .clone_from_slice(&payload[..payload_len_this_frame]);
         bufs[active_frame][tail_byte_i] = tail_byte.value();
 
-        can_send(
-            can,
-            can_id,
-            // &bufs[active_frame][..tail_byte_i + 1],
-            &bufs[active_frame][..tail_byte_i + 1],
-            tail_byte_i as u8 + 1,
-            fd_mode,
-        )?;
+        let f = FRAME::new(id, &bufs[active_frame][..payload_len_this_frame]).unwrap();
+        self.tx_queue
+            .push_back(f)
+            .map_err(|_| CanError::TransmitQueueFull)?;
 
-        latest_i_sent += payload_len_this_frame; // 8 byte frame size, - 1 for each frame's tail byte.
+        let mut latest_i_sent = payload_len_this_frame - 1;
+
         active_frame += 1;
+
+        // Populate subsequent frames.
+        while latest_i_sent < payload.len() - 1 {
+            let payload_i = latest_i_sent + 1;
+            if payload_i + frame_payload_len <= payload.len() {
+                // Not the last frame.
+                payload_len_this_frame = frame_payload_len - 1;
+                component = TransferComponent::MultiMid(tail_byte.toggle);
+            } else {
+                // Last frame.
+                payload_len_this_frame = payload.len() - payload_i;
+                component = TransferComponent::MultiEnd(tail_byte.toggle);
+            }
+
+            tail_byte = make_tail_byte(component, transfer_id);
+
+            bufs[active_frame][0..payload_len_this_frame]
+                .clone_from_slice(&payload[payload_i..payload_i + payload_len_this_frame]);
+
+            let tail_byte_i = find_tail_byte_index(payload_len_this_frame as u8);
+            bufs[active_frame][tail_byte_i] = tail_byte.value();
+
+            let f = FRAME::new(id, &bufs[active_frame][..payload_len_this_frame]).unwrap();
+            self.tx_queue
+                .push_back(f)
+                .map_err(|_| CanError::TransmitQueueFull)?;
+
+            latest_i_sent += payload_len_this_frame; // 8 byte frame size, - 1 for each frame's tail byte.
+            active_frame += 1;
+        }
+
+        Ok(())
     }
 
-    Ok(())
+    /// Send a DroneCAN "broadcast" message. See [The DroneCAN spec, transport layer page](https://dronecan.github.io/Specification/4._CAN_bus_transport_layer/)
+    /// Should be broadcast at interval between 2 and 1000ms.
+    /// Note: The payload must be static, and include space for the tail byte.
+    pub fn broadcast(
+        &mut self,
+        frame_type: FrameType,
+        msg_type: MsgType,
+        source_node_id: u8,
+        payload: &[u8],
+        fd_mode: bool,
+    ) -> Result<(), CanError> {
+        // This saves some if logic in node firmware re decision to broadcast.
+        if source_node_id == 0 && frame_type != FrameType::MessageAnon {
+            return Err(CanError::PayloadData);
+        }
+
+        // get the transfer descriptor
+        // first construct the key from the info provided, then
+        // we can get the descriptor from the hashmap
+        let txf_key = match frame_type {
+            FrameType::Message => TransferDescKey::Message(msg_type.id(), source_node_id),
+            FrameType::MessageAnon => TransferDescKey::MessageAnon(msg_type.id()),
+            FrameType::Service(s) => {
+                TransferDescKey::Service(msg_type.id(), source_node_id, s.dest_node_id)
+            }
+        };
+        let mut txf_desc = match self.txf_map.entry(txf_key) {
+            Entry::Occupied(v) => *v.get(),
+            Entry::Vacant(v) => {
+                let desc = TransferDesc {
+                    transfer_id: 0,
+                    last_txfer: 0,
+                };
+                v.insert(desc).map_err(|_| CanError::TransferMapFull)?;
+                desc
+            }
+        };
+        // if this is a service reply, use the existing transfer id, otherwise, increment and
+        // use that.
+        let transfer_id = match frame_type {
+            FrameType::Service(s) => {
+                if s.req_or_resp == RequestResponse::Response {
+                    txf_desc.transfer_id()
+                } else {
+                    txf_desc.transfer_id_then_incr()
+                }
+            }
+            _ => txf_desc.transfer_id_then_incr(),
+        };
+        txf_desc.last_txfer += 1;
+        let can_id = CanId {
+            priority: msg_type.priority(),
+            type_id: msg_type.id(),
+            source_node_id,
+            frame_type,
+        };
+
+        let frame_payload_len = if fd_mode {
+            DATA_FRAME_MAX_LEN_FD
+        } else {
+            DATA_FRAME_MAX_LEN_LEGACY
+        };
+
+        // The transfer payload is up to 7 bytes for non-FD DRONECAN.
+        // If data is longer than a single frame, set up a multi-frame transfer.
+        if payload.len() >= frame_payload_len {
+            return self.queue_multiple_frames(
+                payload,
+                can_id.value(),
+                transfer_id,
+                fd_mode,
+                msg_type.base_crc(),
+            );
+        }
+
+        // make a new buffer to construct the data for a single frame, we need to append one byte
+        // to the payload for the tail byte
+        let mut buf: Vec<u8, DATA_FRAME_MAX_LEN_FD> = Vec::new();
+        buf.copy_from_slice(payload);
+        let tail_byte = make_tail_byte(TransferComponent::SingleFrame, transfer_id);
+        buf.push(tail_byte.value()).ok();
+
+        let id = embedded_can::Id::Extended(embedded_can::ExtendedId::new(can_id.value()).unwrap());
+        self.tx_queue
+            .push_back(FRAME::new(id, buf.as_slice()).unwrap())
+            .map_err(|_| CanError::TransmitQueueFull)?;
+        Ok(())
+    }
 }
-
-/// Send a DroneCAN "broadcast" message. See [The DroneCAN spec, transport layer page](https://dronecan.github.io/Specification/4._CAN_bus_transport_layer/)
-/// Should be broadcast at interval between 2 and 1000ms.
-/// Note: The payload must be static, and include space for the tail byte.
-pub fn broadcast(
-    can: &mut Can_,
-    frame_type: FrameType,
-    msg_type: MsgType,
-    source_node_id: u8,
-    transfer_id: u8,
-    payload: &mut [u8],
-    fd_mode: bool,
-    payload_size: Option<usize>, // Overrides that of message_type if present.
-) -> Result<(), CanError> {
-    // This saves some if logic in node firmware re decision to broadcast.
-
-    if source_node_id == 0 && frame_type != FrameType::MessageAnon {
-        return Err(CanError::PayloadData);
-    }
-
-    let can_id = CanId {
-        priority: msg_type.priority(),
-        type_id: msg_type.id(),
-        source_node_id,
-        frame_type,
-    };
-
-    let payload_len = match payload_size {
-        Some(l) => l as u16,
-        None => msg_type.payload_size() as u16,
-    };
-
-    let frame_payload_len = if fd_mode {
-        DATA_FRAME_MAX_LEN_FD
-    } else {
-        DATA_FRAME_MAX_LEN_LEGACY
-    };
-
-    // The transfer payload is up to 7 bytes for non-FD DRONECAN.
-    // If data is longer than a single frame, set up a multi-frame transfer.
-    // We subtract one to accomodate the tail byte.
-    if payload_len > (frame_payload_len - 1) as u16 {
-        return send_multiple_frames(
-            can,
-            payload,
-            payload_len,
-            can_id.value(),
-            transfer_id,
-            fd_mode,
-            msg_type.base_crc(),
-        );
-    }
-
-    let tail_byte = make_tail_byte(TransferComponent::SingleFrame, transfer_id);
-    let tail_byte_i = find_tail_byte_index(payload_len as u8);
-
-    if tail_byte_i >= payload.len() {
-        return Err(CanError::PayloadSize);
-    }
-
-    payload[tail_byte_i] = tail_byte.value();
-
-    can_send(
-        can,
-        can_id.value(),
-        &payload[..tail_byte_i + 1],
-        // The frame data length here includes the tail byte
-        tail_byte_i as u8 + 1,
-        fd_mode,
-    )
-}
-
 // todo: You need a fn to get a payload from multiple frames
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/341.NodeStatus.uavcan
 /// Standard data type: uavcan.protocol.NodeStatus
 /// Must be broadcast at intervals between 2 and 1000ms. FC firmware should
 /// consider the node to be faulty if this is not received for 3s.
-pub fn publish_node_status(
-    can: &mut Can_,
+pub fn publish_node_status<CAN, FRAME>(
+    can: &mut Uavcan<CAN, FRAME>,
     health: NodeHealth,
     mode: NodeMode,
     vendor_specific_status_code: u16,
     uptime_sec: u32,
     fd_mode: bool,
     node_id: u8,
-) -> Result<(), CanError> {
+) -> Result<(), CanError>
+where
+    CAN: embedded_can::blocking::Can<Frame = FRAME>,
+    FRAME: embedded_can::Frame,
+{
     let status = NodeStatus {
         uptime_sec,
         health,
@@ -399,24 +337,19 @@ pub fn publish_node_status(
 
     buf[..m_type.payload_size() as usize].clone_from_slice(&status.to_bytes());
 
-    let transfer_id = TRANSFER_ID_NODE_STATUS.fetch_add(1, Ordering::Relaxed);
-
-    broadcast(
-        can,
+    can.broadcast(
         FrameType::Message,
         m_type,
         node_id,
-        transfer_id as u8,
-        buf,
+        &status.to_bytes(),
         fd_mode,
-        None,
     )
 }
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/1.GetNodeInfo.uavcan
 /// A composite type sent in response to a request.
-pub fn publish_node_info(
-    can: &mut Can_,
+pub fn publish_node_info<CAN, FRAME>(
+    can: &mut Uavcan<CAN, FRAME>,
     status: &NodeStatus,
     software_version: &SoftwareVersion,
     hardware_version: &HardwareVersion,
@@ -424,7 +357,11 @@ pub fn publish_node_info(
     fd_mode: bool,
     node_id: u8,
     requester_node_id: u8,
-) -> Result<(), CanError> {
+) -> Result<(), CanError>
+where
+    CAN: embedded_can::blocking::Can<Frame = FRAME>,
+    FRAME: embedded_can::Frame,
+{
     let m_type = MsgType::GetNodeInfo;
     let buf = unsafe { &mut BUF_NODE_INFO };
 
@@ -466,39 +403,30 @@ pub fn publish_node_info(
         buf[41..41 + node_name.len()].clone_from_slice(node_name);
     }
 
-    // println!("Buf: {:?}", buf);
-
-    let transfer_id = TRANSFER_ID_NODE_INFO.fetch_add(1, Ordering::Relaxed);
-
     let frame_type = FrameType::Service(ServiceData {
         dest_node_id: requester_node_id,
         req_or_resp: RequestResponse::Response,
     });
 
-    broadcast(
-        can,
-        frame_type,
-        m_type,
-        node_id,
-        transfer_id as u8,
-        buf,
-        fd_mode,
-        Some(payload_size),
-    )
+    can.broadcast(frame_type, m_type, node_id, buf, fd_mode)
 }
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/4.GetTransportStats.uavcan
 /// Standard data type: uavcan.protocol.GetTransportStats
 /// This is published in response to a requested.
 /// todo: What is the data type ID? 4 is in conflict.
-pub fn publish_transport_stats(
-    can: &mut Can_,
+pub fn publish_transport_stats<CAN, FRAME>(
+    can: &mut Uavcan<CAN, FRAME>,
     num_transmitted: u64,
     num_received: u64,
     num_errors: u64,
     fd_mode: bool,
     node_id: u8,
-) -> Result<(), CanError> {
+) -> Result<(), CanError>
+where
+    CAN: embedded_can::blocking::Can<Frame = FRAME>,
+    FRAME: embedded_can::Frame,
+{
     let m_type = MsgType::TransportStats;
 
     let buf = unsafe { &mut BUF_TRANSPORT_STATS };
@@ -507,77 +435,50 @@ pub fn publish_transport_stats(
     buf[6..12].clone_from_slice(&num_received.to_le_bytes()[..6]);
     buf[12..18].clone_from_slice(&num_errors.to_le_bytes()[..6]);
 
-    // Not used: Can interface stats.
-
-    let transfer_id = TRANSFER_ID_TRANSPORT_STATS.fetch_add(1, Ordering::Relaxed);
-
-    broadcast(
-        can,
-        FrameType::Message,
-        m_type,
-        node_id,
-        transfer_id as u8,
-        buf,
-        fd_mode,
-        None,
-    )
+    can.broadcast(FrameType::Message, m_type, node_id, buf, fd_mode)
 }
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/5.Panic.uavcan
 /// "Nodes that are expected to react to this message should wait for at least MIN_MESSAGES subsequent messages
 /// with any reason text from any sender published with the interval no higher than MAX_INTERVAL_MS before
 /// undertaking any emergency actions." (Min messages: 3. Max interval: 500ms)
-pub fn publish_panic(
-    can: &mut Can_,
+pub fn publish_panic<CAN, FRAME>(
+    can: &mut Uavcan<CAN, FRAME>,
     reason_text: &mut [u8],
     fd_mode: bool,
     node_id: u8,
-) -> Result<(), CanError> {
+) -> Result<(), CanError>
+where
+    CAN: embedded_can::blocking::Can<Frame = FRAME>,
+    FRAME: embedded_can::Frame,
+{
     if reason_text.len() > 7 {
         return Err(CanError::PayloadSize);
     }
 
     let m_type = MsgType::Panic;
 
-    let transfer_id = TRANSFER_ID_PANIC.fetch_add(1, Ordering::Relaxed);
-
-    broadcast(
-        can,
-        FrameType::Message,
-        m_type,
-        node_id,
-        transfer_id as u8,
-        reason_text,
-        fd_mode,
-        None,
-    )
+    can.broadcast(FrameType::Message, m_type, node_id, reason_text, fd_mode)
 }
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/4.GlobalTimeSync.uavcan
-pub fn publish_time_sync(
-    can: &mut Can_,
+pub fn publish_time_sync<CAN, FRAME>(
+    can: &mut Uavcan<CAN, FRAME>,
     previous_transmission_timestamp_usec: u64,
     fd_mode: bool,
     node_id: u8,
-) -> Result<(), CanError> {
+) -> Result<(), CanError>
+where
+    CAN: embedded_can::blocking::Can<Frame = FRAME>,
+    FRAME: embedded_can::Frame,
+{
     let m_type = MsgType::GlobalTimeSync;
 
     let buf = unsafe { &mut BUF_TIME_SYNC };
 
     buf[..7].clone_from_slice(&previous_transmission_timestamp_usec.to_le_bytes());
 
-    let transfer_id = TRANSFER_ID_GLOBAL_TIME_SYNC.fetch_add(1, Ordering::Relaxed);
-
-    broadcast(
-        can,
-        FrameType::Message,
-        m_type,
-        node_id,
-        transfer_id as u8,
-        buf,
-        fd_mode,
-        None,
-    )?;
+    can.broadcast(FrameType::Message, m_type, node_id, buf, fd_mode)?;
 
     Ok(())
 }
@@ -585,13 +486,17 @@ pub fn publish_time_sync(
 // todo: Publish air data
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/air_data/1028.StaticPressure.uavcan
-pub fn publish_static_pressure(
-    can: &mut Can_,
+pub fn publish_static_pressure<CAN, FRAME>(
+    can: &mut Uavcan<CAN, FRAME>,
     pressure: f32,          // Pascal
     pressure_variance: f32, // Pascal^2. 16-bit
     fd_mode: bool,
     node_id: u8,
-) -> Result<(), CanError> {
+) -> Result<(), CanError>
+where
+    CAN: embedded_can::blocking::Can<Frame = FRAME>,
+    FRAME: embedded_can::Frame,
+{
     let m_type = MsgType::StaticPressure;
 
     let buf = unsafe { &mut BUF_PRESSURE };
@@ -601,28 +506,21 @@ pub fn publish_static_pressure(
     let pressure_variance = f16::from_f32(pressure_variance);
     buf[4..6].copy_from_slice(&pressure_variance.to_le_bytes());
 
-    let transfer_id = TRANSFER_ID_STATIC_PRESSURE.fetch_add(1, Ordering::Relaxed);
-
-    broadcast(
-        can,
-        FrameType::Message,
-        m_type,
-        node_id,
-        transfer_id as u8,
-        buf,
-        fd_mode,
-        None,
-    )
+    can.broadcast(FrameType::Message, m_type, node_id, buf, fd_mode)
 }
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/air_data/1029.StaticTemperature.uavcan
-pub fn publish_temperature(
-    can: &mut Can_,
+pub fn publish_temperature<CAN, FRAME>(
+    can: &mut Uavcan<CAN, FRAME>,
     temperature: f32,          // Kelvin. 16-bit.
     temperature_variance: f32, // Kelvin^2. 16-bit
     fd_mode: bool,
     node_id: u8,
-) -> Result<(), CanError> {
+) -> Result<(), CanError>
+where
+    CAN: embedded_can::blocking::Can<Frame = FRAME>,
+    FRAME: embedded_can::Frame,
+{
     let m_type = MsgType::StaticTemperature;
 
     let buf = unsafe { &mut BUF_TEMPERATURE };
@@ -633,114 +531,45 @@ pub fn publish_temperature(
     let temperature_variance = f16::from_f32(temperature_variance);
     buf[2..4].clone_from_slice(&temperature_variance.to_le_bytes());
 
-    let transfer_id = TRANSFER_ID_STATIC_TEMPERATURE.fetch_add(1, Ordering::Relaxed);
-
-    broadcast(
-        can,
-        FrameType::Message,
-        m_type,
-        node_id,
-        transfer_id as u8,
-        buf,
-        fd_mode,
-        None,
-    )
+    can.broadcast(FrameType::Message, m_type, node_id, buf, fd_mode)
 }
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/ahrs/1000.Solution.uavcan
-pub fn publish_ahrs_solution(
-    can: &mut Can_,
-    timestamp: u64,              // 7-bytes, us.
-    orientation: &[f32; 4],      // f16. X Y Z W
-    angular_velocity: &[f32; 3], // f16. X, Y, Z.
-    linear_accel: &[f32; 3],     // f16. X, Y, Z.
+pub fn publish_ahrs_solution<CAN, FRAME>(
+    can: &mut Uavcan<CAN, FRAME>,
+    solution: AhrsSolution,
     fd_mode: bool,
     node_id: u8,
-) -> Result<(), CanError> {
-    let m_type = MsgType::AhrsSolution;
+) -> Result<(), CanError>
+where
+    CAN: embedded_can::blocking::Can<Frame = FRAME>,
+    FRAME: embedded_can::Frame,
+{
+    let mut buf = Vec::new();
+    solution.to_bytes(&mut buf);
 
-    // let mut buf = [0; crate::find_tail_byte_index(PAYLOAD_SIZE_MAGNETIC_FIELD_STRENGTH2 as u8) + 1];
-    let buf = unsafe { &mut BUF_AHRS_SOLUTION };
-
-    let or_x = f16::from_f32(orientation[0]);
-    let or_y = f16::from_f32(orientation[1]);
-    let or_z = f16::from_f32(orientation[2]);
-    let or_w = f16::from_f32(orientation[3]);
-
-    let ang_v_x = f16::from_f32(angular_velocity[0]);
-    let ang_v_y = f16::from_f32(angular_velocity[1]);
-    let ang_v_z = f16::from_f32(angular_velocity[2]);
-
-    let lin_acc_x = f16::from_f32(linear_accel[0]);
-    let lin_acc_y = f16::from_f32(linear_accel[1]);
-    let lin_acc_z = f16::from_f32(linear_accel[2]);
-
-    buf[..7].clone_from_slice(&timestamp.to_le_bytes()[0..7]);
-
-    let bits = buf.view_bits_mut::<Msb0>();
-
-    let mut i = 56; // bits
-
-    for v in &[or_x, or_y, or_z, or_w] {
-        let v = u16::from_le_bytes(v.to_le_bytes());
-        bits[i..i + 16].store_le(v);
-        i += 16;
-    }
-
-    // 4-bit pad and 0-len covar
-    bits[i..i + 8].store_le(0);
-    i += 8;
-
-    for v in &[ang_v_x, ang_v_y, ang_v_z] {
-        let v = u16::from_le_bytes(v.to_le_bytes());
-        bits[i..i + 16].store_le(v);
-        i += 16;
-    }
-
-    // 4-bit pad and 0-len covar
-    bits[i..i + 8].store_le(0);
-    i += 8;
-
-    for v in &[lin_acc_x, lin_acc_y, lin_acc_z] {
-        let v = u16::from_le_bytes(v.to_le_bytes());
-        bits[i..i + 16].store_le(v);
-        i += 16;
-    }
-
-    // For FD mode, ensure final len field for lin acc cov is 0.
-    bits[i..i + 4].store_le(0);
-
-    // todo: Covariance as-required.
-
-    let transfer_id = TRANSFER_ID_AHRS_SOLUTION.fetch_add(1, Ordering::Relaxed);
-
-    let payload_size = if fd_mode {
-        m_type.payload_size() + 1 // Due to no TCO on final cov array.
-    } else {
-        m_type.payload_size()
-    };
-
-    broadcast(
-        can,
+    can.broadcast(
         FrameType::Message,
-        m_type,
+        MsgType::AhrsSolution,
         node_id,
-        transfer_id as u8,
-        buf,
+        buf.as_mut_slice(),
         fd_mode,
-        Some(payload_size as usize),
     )
 }
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/ahrs/1002.MagneticFieldStrength2.uavcan
-pub fn publish_mag_field_strength(
-    can: &mut Can_,
+pub fn publish_mag_field_strength<CAN, FRAME>(
+    can: &mut Uavcan<CAN, FRAME>,
     sensor_id: u8,
     magnetic_field: &[f32; 3],          // f16. Gauss; X, Y, Z.
     _magnetic_field_covariance: &[f32], // f16
     fd_mode: bool,
     node_id: u8,
-) -> Result<(), CanError> {
+) -> Result<(), CanError>
+where
+    CAN: embedded_can::blocking::Can<Frame = FRAME>,
+    FRAME: embedded_can::Frame,
+{
     let m_type = MsgType::MagneticFieldStrength2;
 
     // let mut buf = [0; crate::find_tail_byte_index(PAYLOAD_SIZE_MAGNETIC_FIELD_STRENGTH2 as u8) + 1];
@@ -764,23 +593,12 @@ pub fn publish_mag_field_strength(
     };
     // todo: Covariance as-required.
 
-    let transfer_id = TRANSFER_ID_MAGNETIC_FIELD_STRENGTH2.fetch_add(1, Ordering::Relaxed);
-
-    broadcast(
-        can,
-        FrameType::Message,
-        m_type,
-        node_id,
-        transfer_id as u8,
-        buf,
-        fd_mode,
-        payload_size,
-    )
+    can.broadcast(FrameType::Message, m_type, node_id, buf, fd_mode)
 }
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/ahrs/1003.RawIMU.uavcan
-pub fn publish_raw_imu(
-    can: &mut Can_,
+pub fn publish_raw_imu<CAN, FRAME>(
+    can: &mut Uavcan<CAN, FRAME>,
     timestamp: u64,  // 7-bytes, us.
     gyro: [f32; 3],  // f16. x, y, z. rad/s (Roll, pitch, yaw)
     accel: [f32; 3], // f16. x, y, z. m/s^2
@@ -788,7 +606,11 @@ pub fn publish_raw_imu(
     // todo: Covariances?
     fd_mode: bool,
     node_id: u8,
-) -> Result<(), CanError> {
+) -> Result<(), CanError>
+where
+    CAN: embedded_can::blocking::Can<Frame = FRAME>,
+    FRAME: embedded_can::Frame,
+{
     let m_type = MsgType::RawImu;
 
     let buf = unsafe { &mut BUF_RAW_IMU };
@@ -808,68 +630,54 @@ pub fn publish_raw_imu(
 
     // todo: Covariance, and integration as-required.
 
-    let transfer_id = TRANSFER_ID_RAW_IMU.fetch_add(1, Ordering::Relaxed);
-
     let payload_size = if fd_mode {
         m_type.payload_size() + 1 // Due to no TCO on final cov array.
     } else {
         m_type.payload_size()
     };
 
-    broadcast(
-        can,
-        FrameType::Message,
-        m_type,
-        node_id,
-        transfer_id as u8,
-        buf,
-        fd_mode,
-        Some(payload_size as usize),
-    )
+    can.broadcast(FrameType::Message, m_type, node_id, buf, fd_mode)
 }
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/navigation/2000.GlobalNavigationSolution.uavcan
-pub fn publish_global_navigation_solution(
-    can: &mut Can_,
+pub fn publish_global_navigation_solution<CAN, FRAME>(
+    can: &mut Uavcan<CAN, FRAME>,
     data: &GlobalNavSolution,
     // todo: Covariances?
     fd_mode: bool,
     node_id: u8,
-) -> Result<(), CanError> {
+) -> Result<(), CanError>
+where
+    CAN: embedded_can::blocking::Can<Frame = FRAME>,
+    FRAME: embedded_can::Frame,
+{
     let m_type = MsgType::GlobalNavigationSolution;
 
     let buf = unsafe { &mut BUF_GLOBAL_NAVIGATION_SOLUTION };
 
     buf[..m_type.payload_size() as usize].clone_from_slice(&data.pack().unwrap());
 
-    let transfer_id = TRANSFER_ID_GLOBAL_NAVIGATION_SOLUTION.fetch_add(1, Ordering::Relaxed);
-
     let payload_size = if fd_mode {
         m_type.payload_size() + 1 // Due to no TCO on final cov array.
     } else {
         m_type.payload_size()
     };
 
-    broadcast(
-        can,
-        FrameType::Message,
-        m_type,
-        node_id,
-        transfer_id as u8,
-        buf,
-        fd_mode,
-        Some(payload_size as usize),
-    )
+    can.broadcast(FrameType::Message, m_type, node_id, buf, fd_mode)
 }
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/gnss/1061.Auxiliary.uavcan
-pub fn publish_gnss_aux(
-    can: &mut Can_,
+pub fn publish_gnss_aux<CAN, FRAME>(
+    can: &mut Uavcan<CAN, FRAME>,
     data: &GnssAuxiliary,
     // todo: Covariances?
     fd_mode: bool,
     node_id: u8,
-) -> Result<(), CanError> {
+) -> Result<(), CanError>
+where
+    CAN: embedded_can::blocking::Can<Frame = FRAME>,
+    FRAME: embedded_can::Frame,
+{
     // let mut buf = [0; crate::find_tail_byte_index(PAYLOAD_SIZE_MAGNETIC_FIELD_STRENGTH2 as u8) + 1];
     let buf = unsafe { &mut BUF_GNSS_AUX };
 
@@ -877,60 +685,46 @@ pub fn publish_gnss_aux(
 
     buf[..m_type.payload_size() as usize].clone_from_slice(&data.to_bytes());
 
-    let transfer_id = TRANSFER_ID_GNSS_AUX.fetch_add(1, Ordering::Relaxed);
-
-    broadcast(
-        can,
-        FrameType::Message,
-        m_type,
-        node_id,
-        transfer_id as u8,
-        buf,
-        fd_mode,
-        None,
-    )
+    can.broadcast(FrameType::Message, m_type, node_id, buf, fd_mode)
 }
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/gnss/1063.Fix2.uavcan
-pub fn publish_fix2(
-    can: &mut Can_,
+pub fn publish_fix2<CAN, FRAME>(
+    can: &mut Uavcan<CAN, FRAME>,
     data: &FixDronecan,
     // todo: Covariances?
     fd_mode: bool,
     node_id: u8,
-) -> Result<(), CanError> {
+) -> Result<(), CanError>
+where
+    CAN: embedded_can::blocking::Can<Frame = FRAME>,
+    FRAME: embedded_can::Frame,
+{
     let buf = unsafe { &mut BUF_FIX2 };
 
     let m_type = MsgType::Fix2;
 
     buf[..m_type.payload_size() as usize].clone_from_slice(&data.pack().unwrap());
 
-    let transfer_id = TRANSFER_ID_FIX2.fetch_add(1, Ordering::Relaxed);
-
-    broadcast(
-        can,
-        FrameType::Message,
-        m_type,
-        node_id,
-        transfer_id as u8,
-        buf,
-        fd_mode,
-        None,
-    )
+    can.broadcast(FrameType::Message, m_type, node_id, buf, fd_mode)
 }
 
 /// https://github.com/dronecan/DSDL/blob/master/ardupilot/gnss/20003.Status.uavcan
 /// Standard data type: uavcan.protocol.NodeStatus
 /// Must be broadcast at intervals between 2 and 1000ms. FC firmware should
 /// consider the node to be faulty if this is not received for 3s.
-pub fn publish_ardupilot_gnss_status(
-    can: &mut Can_,
+pub fn publish_ardupilot_gnss_status<CAN, FRAME>(
+    can: &mut Uavcan<CAN, FRAME>,
     error_codes: u32,
-    healthy: bool,
-    status: u32,
+    _healthy: bool,
+    _status: u32,
     fd_mode: bool,
     node_id: u8,
-) -> Result<(), CanError> {
+) -> Result<(), CanError>
+where
+    CAN: embedded_can::blocking::Can<Frame = FRAME>,
+    FRAME: embedded_can::Frame,
+{
     let m_type = MsgType::ArdupilotGnssStatus;
 
     let buf = unsafe { &mut BUF_ARDUPILOT_GNSS_STATUS };
@@ -944,149 +738,26 @@ pub fn publish_ardupilot_gnss_status(
 
     buf[4] = 0x81; // armable and status 0. Having trouble with bit masks.
 
-    let transfer_id = TRANSFER_ID_ARDUPILOT_GNSS_STATUS.fetch_add(1, Ordering::Relaxed);
-
-    broadcast(
-        can,
-        FrameType::Message,
-        m_type,
-        node_id,
-        transfer_id as u8,
-        buf,
-        fd_mode,
-        None,
-    )
-}
-
-/// https://github.com/dronecan/DSDL/blob/master/dronecan/sensors/rc/1140.RCInput.uavcan
-pub fn publish_rc_input(
-    can: &mut Can_,
-    status: u16,   // 1: valid. 2: failsafe.
-    quality: u8,   // `quality` is scaled between 0 (no signal) and 255 (full signal)
-    id: u8,        // u4
-    rc_in: &[u16], // Includes control and aux channels. Each is 12-bits
-    num_channels: u8,
-    fd_mode: bool,
-    node_id: u8,
-) -> Result<(), CanError> {
-    let buf = unsafe { &mut BUF_RC_INPUT };
-
-    const CHAN_SIZE_BITS: usize = 12;
-
-    let m_type = MsgType::RcInput;
-
-    buf[0..2].copy_from_slice(&status.to_le_bytes());
-    buf[2] = quality;
-    buf[3] = (id & 0b1111) << 4;
-
-    let bits = buf.view_bits_mut::<Msb0>();
-
-    let mut i_bits = 28; // (u16 + u8 + u4 status, quality, id)
-
-    // For FD, add the length field of 6 bits.
-    if fd_mode {
-        bits[i_bits..i_bits + 6].store_be(num_channels); // Why BE?
-        i_bits += 6;
-    }
-
-    let payload_len = crate::bit_size_to_byte_size(i_bits + num_channels as usize * CHAN_SIZE_BITS);
-
-    for ch in rc_in {
-        // Bit level alignment mess sorted out by examining DC messages
-        let nibble_right = ch & 0xf;
-        let nibble_middle = (ch >> 4) & 0xf;
-        let nibble_left = (ch >> 8) & 0xf;
-
-        let re_arranged = (nibble_middle << 8) | (nibble_right << 4) | nibble_left;
-        bits[i_bits..i_bits + CHAN_SIZE_BITS].store_be(re_arranged);
-
-        i_bits += CHAN_SIZE_BITS;
-    }
-
-    let transfer_id = TRANSFER_ID_RC_INPUT.fetch_add(1, Ordering::Relaxed);
-
-    broadcast(
-        can,
-        FrameType::Message,
-        m_type,
-        node_id,
-        transfer_id as u8,
-        buf,
-        fd_mode,
-        Some(payload_len),
-    )
-}
-
-/// AnyLeaf custom format, for now, but may be merged into the DSDL.
-pub fn publish_link_stats(
-    can: &mut Can_,
-    data: &LinkStats,
-    fd_mode: bool,
-    node_id: u8,
-) -> Result<(), CanError> {
-    let buf = unsafe { &mut BUF_LINK_STATS };
-
-    let m_type = MsgType::LinkStats;
-
-    buf[0..m_type.payload_size() as usize].copy_from_slice(&data.to_bytes());
-
-    let transfer_id = TRANSFER_ID_LINK_STATS.fetch_add(1, Ordering::Relaxed);
-
-    broadcast(
-        can,
-        FrameType::Message,
-        m_type,
-        node_id,
-        transfer_id as u8,
-        buf,
-        fd_mode,
-        None,
-    )
-}
-
-/// Perhaps similar to [DSDL's tunneling messages](https://github.com/dronecan/DSDL/tree/master/uavcan/tunnel)
-pub fn publish_telemetry(
-    can: &mut Can_,
-    data: &[u8],
-    payload_len: usize,
-    fd_mode: bool,
-    node_id: u8,
-) -> Result<(), CanError> {
-    let buf = unsafe { &mut BUF_TELEMETRY };
-
-    let m_type = MsgType::Telemetry;
-
-    buf[..payload_len].copy_from_slice(&data[..payload_len]);
-
-    let transfer_id = TRANSFER_ID_TELEMETRY.fetch_add(1, Ordering::Relaxed);
-
-    broadcast(
-        can,
-        FrameType::Message,
-        m_type,
-        node_id,
-        transfer_id as u8,
-        buf,
-        fd_mode,
-        Some(payload_len),
-    )
+    can.broadcast(FrameType::Message, m_type, node_id, buf, fd_mode)
 }
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/dynamic_node_id/1.Allocation.uavcan
 /// Send while the node is anonymous; requests an ID.
-pub fn request_id_allocation_req(
-    can: &mut Can_,
+pub fn request_id_allocation_req<CAN, FRAME>(
+    can: &mut Uavcan<CAN, FRAME>,
     data: &IdAllocationData,
     fd_mode: bool,
     node_id: u8,
-) -> Result<(), CanError> {
+) -> Result<(), CanError>
+where
+    CAN: embedded_can::blocking::Can<Frame = FRAME>,
+    FRAME: embedded_can::Frame,
+{
     let buf = unsafe { &mut BUF_ID_ALLOCATION };
 
     let m_type = MsgType::IdAllocation;
 
     buf[0..m_type.payload_size() as usize].clone_from_slice(&data.to_bytes(fd_mode));
-
-    let transfer_id = TRANSFER_ID_ID_ALLOCATION.fetch_add(1, Ordering::Relaxed);
 
     // 6 bytes of unique_id unless in the final stage; then 4.
     let len = if fd_mode {
@@ -1097,16 +768,7 @@ pub fn request_id_allocation_req(
         7
     };
 
-    broadcast(
-        can,
-        FrameType::MessageAnon,
-        m_type,
-        node_id,
-        transfer_id as u8,
-        buf,
-        fd_mode,
-        Some(len),
-    )
+    can.broadcast(FrameType::MessageAnon, m_type, node_id, buf, fd_mode)
 }
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/param/11.GetSet.uavcan
@@ -1114,13 +776,17 @@ pub fn request_id_allocation_req(
 /// associated with the index requested. If the requested index doesn't match with a parameter
 /// we have, we reply with an empty response. This indicates that we have passed all parameters.
 /// The requester increments the index starting at 0 to poll parameters available.
-pub fn publish_getset_resp(
-    can: &mut Can_,
+pub fn publish_getset_resp<CAN, FRAME>(
+    can: &mut Uavcan<CAN, FRAME>,
     data: &GetSetResponse,
     fd_mode: bool,
     node_id: u8,
     requester_node_id: u8,
-) -> Result<(), CanError> {
+) -> Result<(), CanError>
+where
+    CAN: embedded_can::blocking::Can<Frame = FRAME>,
+    FRAME: embedded_can::Frame,
+{
     let buf = unsafe { &mut BUF_GET_SET };
 
     // //Empty the buffer in case this message is shorter than the previous one; variable length.
@@ -1130,35 +796,28 @@ pub fn publish_getset_resp(
 
     let len = data.to_bytes(buf, fd_mode);
 
-    let transfer_id = TRANSFER_ID_GET_SET.fetch_add(1, Ordering::Relaxed);
-
     let frame_type = FrameType::Service(ServiceData {
         dest_node_id: requester_node_id,
         req_or_resp: RequestResponse::Response,
     });
 
-    broadcast(
-        can,
-        frame_type,
-        m_type,
-        node_id,
-        transfer_id as u8,
-        buf,
-        fd_mode,
-        Some(len),
-    )
+    can.broadcast(frame_type, m_type, node_id, buf, fd_mode)
 }
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/4.GlobalTimeSync.uavcan
-pub fn _handle_time_sync(
-    can: &mut Can_,
+pub fn _handle_time_sync<CAN, FRAME>(
+    _can: &mut Uavcan<CAN, FRAME>,
     payload: &[u8],
-    fd_mode: bool,
-    node_id: u8,
-) -> Result<(), CanError> {
+    _fd_mode: bool,
+    _node_id: u8,
+) -> Result<(), CanError>
+where
+    CAN: embedded_can::blocking::Can<Frame = FRAME>,
+    FRAME: embedded_can::Frame,
+{
     let mut buf = [0; 8];
     buf[..7].clone_from_slice(payload);
-    let previous_transmission_timestamp_usec = u64::from_le_bytes(buf);
+    let _previous_transmission_timestamp_usec = u64::from_le_bytes(buf);
 
     // todo: Handle.
 
@@ -1166,20 +825,22 @@ pub fn _handle_time_sync(
 }
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/5.RestartNode.uavcan
-pub fn handle_restart_request(
-    can: &mut Can_,
+pub fn handle_restart_request<CAN, FRAME>(
+    can: &mut Uavcan<CAN, FRAME>,
     payload: &[u8],
     fd_mode: bool,
     node_id: u8,
     requester_node_id: u8,
-) -> Result<(), CanError> {
+) -> Result<(), CanError>
+where
+    CAN: embedded_can::blocking::Can<Frame = FRAME>,
+    FRAME: embedded_can::Frame,
+{
     let m_type = MsgType::Restart;
 
     let mut num_bytes = [0; 8];
     num_bytes[..5].clone_from_slice(payload);
     let magic_number = u64::from_le_bytes(num_bytes);
-
-    let transfer_id = TRANSFER_ID_RESTART.fetch_add(1, Ordering::Relaxed);
 
     if magic_number != 0xAC_CE55_1B1E {
         let frame_type = FrameType::Service(ServiceData {
@@ -1187,15 +848,12 @@ pub fn handle_restart_request(
             req_or_resp: RequestResponse::Response,
         });
 
-        broadcast(
-            can,
+        can.broadcast(
             frame_type,
             m_type,
             node_id,
-            transfer_id as u8,
             &mut [0], // ie false; error
             fd_mode,
-            None,
         )?;
 
         return Err(CanError::PayloadData);
@@ -1206,16 +864,13 @@ pub fn handle_restart_request(
         req_or_resp: RequestResponse::Response,
     });
 
-    broadcast(
-        can,
+    can.broadcast(
         frame_type,
         m_type,
         node_id,
-        transfer_id as u8,
         &mut [1], // ie true; success
         // 1,
         fd_mode,
-        None,
     )?;
 
     // let cp = unsafe { cortex_m::Peripherals::steal() };
@@ -1225,24 +880,24 @@ pub fn handle_restart_request(
     Ok(())
 }
 
-fn message_pending_handler(mailbox: Mailbox, header: TxFrameHeader, buf: &[u32]) {
-    println!("Mailbox overflow!");
-}
+// fn message_pending_handler(mailbox: Mailbox, header: TxFrameHeader, buf: &[u32]) {
+//     println!("Mailbox overflow!");
+// }
 
-/// Function to help parse the nested result from CAN rx results
-pub fn get_frame_info(
-    rx_result: Result<ReceiveOverrun<RxFrameInfo>, nb::Error<Infallible>>,
-) -> Result<RxFrameInfo, CanError> {
-    // todo: This masks overruns currently.
+// /// Function to help parse the nested result from CAN rx results
+// pub fn get_frame_info(
+//     rx_result: Result<ReceiveOverrun<RxFrameInfo>, nb::Error<Infallible>>,
+// ) -> Result<RxFrameInfo, CanError> {
+//     // todo: This masks overruns currently.
 
-    match rx_result {
-        Ok(r) => match r {
-            ReceiveOverrun::NoOverrun(frame_info) => Ok(frame_info),
-            ReceiveOverrun::Overrun(frame_info) => Ok(frame_info),
-        },
-        Err(_) => Err(CanError::Hardware),
-    }
-}
+//     match rx_result {
+//         Ok(r) => match r {
+//             ReceiveOverrun::NoOverrun(frame_info) => Ok(frame_info),
+//             ReceiveOverrun::Overrun(frame_info) => Ok(frame_info),
+//         },
+//         Err(_) => Err(CanError::Hardware),
+//     }
+// }
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
@@ -1287,14 +942,18 @@ impl ActuatorCommand {
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/actuator/Command.uavcan
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/actuator/1010.ArrayCommand.uavcan
-pub fn publish_actuator_commands(
-    can: &mut Can_,
+pub fn publish_actuator_commands<CAN, FRAME>(
+    can: &mut Uavcan<CAN, FRAME>,
     commands: &[ActuatorCommand],
     fd_mode: bool,
     node_id: u8,
-) -> Result<(), CanError> {
+) -> Result<(), CanError>
+where
+    CAN: embedded_can::blocking::Can<Frame = FRAME>,
+    FRAME: embedded_can::Frame,
+{
     if commands.len() > 4 {
-        println!("Exceeded present limit of 4 actuator commands");
+        warn!("Exceeded present limit of 4 actuator commands");
         return Err(CanError::PayloadData);
     }
 
@@ -1338,177 +997,12 @@ pub fn publish_actuator_commands(
         }
     }
 
-    let transfer_id = TRANSFER_ID_ACTUATOR_ARRAY_COMMAND.fetch_add(1, Ordering::Relaxed);
-
-    broadcast(
-        can,
-        FrameType::Message,
-        m_type,
-        node_id,
-        transfer_id as u8,
-        buf,
-        fd_mode,
-        Some(payload_len),
-    )
-}
-
-#[repr(u8)]
-#[derive(Clone, Copy, PartialEq, TryFromPrimitive)]
-pub enum BatteryInUse {
-    Main = 0,
-    Backup = 1,
-    None = 2, // Perhaps only shows when powered by USB or CAN
-}
-
-impl Default for BatteryInUse {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
-/// These units are volts, amps etc.
-/// We serialize voltages and currents as u16 mV and mA.
-#[derive(Default, Clone)]
-pub struct PowerStats {
-    pub voltage_batt: f32,
-    pub voltage_batt_backup: f32,
-    pub voltage_5v: f32,
-    pub voltage_7v: f32,
-    //
-    pub voltage_cell1: f32,
-    pub voltage_cell2: f32,
-    pub voltage_cell3: f32,
-    pub voltage_cell4: f32,
-    pub voltage_cell5: f32,
-    pub voltage_cell6: f32,
-    pub voltage_cell7: f32, // Currently unused
-    pub voltage_cell8: f32, // Currently unused
-    //
-    pub current_batt: f32,
-    pub current_batt_backup: f32, // Currently unused
-    pub current_5v: f32,
-    pub current_7v: f32,
-    //
-    pub estimated_portion_through: f32, // Fraction of 1. Serialized as a u8, fraction of 255
-    pub estimated_time_remaining: f32,  // In seconds, serialized as u16 (seconds).
-    pub battery_in_use: BatteryInUse,
-}
-
-fn u16_helper(val: &[u8]) -> f32 {
-    u16::from_le_bytes(val.try_into().unwrap()) as f32 / 1_000.
-}
-
-impl PowerStats {
-    /// Utility function for serializing a float to a 1000-scaled u16.
-    fn add_data_u16(buf: &mut [u8], val: f32, i: &mut usize) {
-        buf[*i..*i + 2].copy_from_slice(&((val * 1_000.) as u16).to_le_bytes());
-        *i += 2;
-    }
-
-    pub fn to_bytes(&self) -> [u8; MsgType::PowerStats.payload_size() as usize] {
-        let mut result = [0; MsgType::PowerStats.payload_size() as usize];
-        let mut i = 0;
-
-        Self::add_data_u16(&mut result, self.voltage_batt, &mut i);
-        Self::add_data_u16(&mut result, self.voltage_batt_backup, &mut i);
-        Self::add_data_u16(&mut result, self.voltage_5v, &mut i);
-        Self::add_data_u16(&mut result, self.voltage_7v, &mut i);
-
-        Self::add_data_u16(&mut result, self.voltage_cell1, &mut i);
-        Self::add_data_u16(&mut result, self.voltage_cell2, &mut i);
-        Self::add_data_u16(&mut result, self.voltage_cell3, &mut i);
-        Self::add_data_u16(&mut result, self.voltage_cell4, &mut i);
-        Self::add_data_u16(&mut result, self.voltage_cell5, &mut i);
-        Self::add_data_u16(&mut result, self.voltage_cell6, &mut i);
-        Self::add_data_u16(&mut result, self.voltage_cell7, &mut i);
-        Self::add_data_u16(&mut result, self.voltage_cell8, &mut i);
-
-        Self::add_data_u16(&mut result, self.current_batt, &mut i);
-        Self::add_data_u16(&mut result, self.current_batt_backup, &mut i);
-        Self::add_data_u16(&mut result, self.current_5v, &mut i);
-        Self::add_data_u16(&mut result, self.current_7v, &mut i);
-
-        result[i] = (self.estimated_portion_through * 255.) as u8;
-        i += 1;
-
-        result[i..i + 2].copy_from_slice(&(self.estimated_time_remaining as u16).to_le_bytes());
-        i += 2;
-        result[i] = self.battery_in_use as u8;
-
-        result
-    }
-
-    pub fn from_bytes(buf: &[u8]) -> Self {
-        /// As in `to_bytes`, we assume the data is in u16 x 1000.
-        Self {
-            // todo: Helper to
-            voltage_batt: u16_helper(&buf[0..2]),
-            voltage_batt_backup: u16_helper(&buf[2..4]),
-            voltage_5v: u16_helper(&buf[4..6]),
-            voltage_7v: u16_helper(&buf[6..8]),
-            //
-            voltage_cell1: u16_helper(&buf[8..10]),
-            voltage_cell2: u16_helper(&buf[10..12]),
-            voltage_cell3: u16_helper(&buf[12..14]),
-            voltage_cell4: u16_helper(&buf[14..16]),
-            voltage_cell5: u16_helper(&buf[16..18]),
-            voltage_cell6: u16_helper(&buf[18..20]),
-            voltage_cell7: u16_helper(&buf[20..22]),
-            voltage_cell8: u16_helper(&buf[22..24]),
-            //
-            current_batt: u16_helper(&buf[24..26]),
-            current_batt_backup: u16_helper(&buf[26..28]),
-            current_5v: u16_helper(&buf[28..30]),
-            current_7v: u16_helper(&buf[30..32]),
-
-            estimated_portion_through: buf[32] as f32 / 255.,
-            estimated_time_remaining: u16_helper(&buf[33..35]),
-            battery_in_use: BatteryInUse::try_from(buf[35]).unwrap(),
-        }
-    }
-}
-
-/// AnyLeaf custom power message
-pub fn publish_power_stats(
-    can: &mut Can_,
-    data: &PowerStats,
-    fd_mode: bool,
-    node_id: u8,
-) -> Result<(), CanError> {
-    let buf = unsafe { &mut BUF_POWER_STATS };
-
-    let m_type = MsgType::PowerStats;
-
-    buf[..MsgType::PowerStats.payload_size() as usize].clone_from_slice(&data.to_bytes());
-
-    let transfer_id = TRANSFER_ID_POWER_STATS.fetch_add(1, Ordering::Relaxed);
-
-    // println!("CAN BUF: {:?}", buf);
-
-    broadcast(
-        can,
-        FrameType::Message,
-        m_type,
-        node_id,
-        transfer_id as u8,
-        buf,
-        fd_mode,
-        None,
-    )
-}
-
-#[derive(Clone, Copy)]
-#[repr(u8)]
-pub enum CircuitStatusErrorFlag {
-    Overvoltage = 1,
-    Undervoltage = 2,
-    Overcurrent = 4,
-    UnderCurrent = 8,
+    can.broadcast(FrameType::Message, m_type, node_id, buf, fd_mode)
 }
 
 /// [DSDL 1091](https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/power/1091.CircuitStatus.uavcan)
-pub fn publish_circuit_status(
-    can: &mut Can_,
+pub fn publish_circuit_status<CAN, FRAME>(
+    can: &mut Uavcan<CAN, FRAME>,
     circuit_id: u16,
     voltage: f32,
     current: f32,
@@ -1516,7 +1010,11 @@ pub fn publish_circuit_status(
     error_flags: u8,
     fd_mode: bool,
     node_id: u8,
-) -> Result<(), CanError> {
+) -> Result<(), CanError>
+where
+    CAN: embedded_can::blocking::Can<Frame = FRAME>,
+    FRAME: embedded_can::Frame,
+{
     let buf = unsafe { &mut BUF_CIRCUIT_STATUS };
 
     let m_type = MsgType::CircuitStatus;
@@ -1532,31 +1030,24 @@ pub fn publish_circuit_status(
     //     buf[6] |= *flag as u8;
     // }
 
-    let transfer_id = TRANSFER_ID_CIRCUIT_STATUS.fetch_add(1, Ordering::Relaxed);
-
-    broadcast(
-        can,
-        FrameType::Message,
-        m_type,
-        node_id,
-        transfer_id as u8,
-        buf,
-        fd_mode,
-        None,
-    )
+    can.broadcast(FrameType::Message, m_type, node_id, buf, fd_mode)
 }
 
 /// [DSDL 1090](https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/power/1090.PrimaryPowerSupplyStatus.uavcan)
-pub fn publish_power_supply_status(
-    can: &mut Can_,
+pub fn publish_power_supply_status<CAN, FRAME>(
+    can: &mut Uavcan<CAN, FRAME>,
     hours_to_empty: f32,
     hours_to_empty_variance: f32,
     external_power_avail: bool,
     remaining_energy_pct: u8,
-    remaining_energy_ct_std: u8,
+    _remaining_energy_ct_std: u8,
     fd_mode: bool,
     node_id: u8,
-) -> Result<(), CanError> {
+) -> Result<(), CanError>
+where
+    CAN: embedded_can::blocking::Can<Frame = FRAME>,
+    FRAME: embedded_can::Frame,
+{
     let buf = unsafe { &mut BUF_POWER_SUPPLY_STATUS };
 
     let m_type = MsgType::PowerSupplyStatus;
@@ -1567,16 +1058,5 @@ pub fn publish_power_supply_status(
     buf[4] = (external_power_avail as u8) << 7 | (remaining_energy_pct & 0b111_1111);
     // Note: Skipping remaining energy pct std for now.
 
-    let transfer_id = TRANSFER_ID_POWER_SUPPLY_STATUS.fetch_add(1, Ordering::Relaxed);
-
-    broadcast(
-        can,
-        FrameType::Message,
-        m_type,
-        node_id,
-        transfer_id as u8,
-        buf,
-        fd_mode,
-        None,
-    )
+    can.broadcast(FrameType::Message, m_type, node_id, buf, fd_mode)
 }

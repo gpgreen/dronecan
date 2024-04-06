@@ -1,12 +1,6 @@
-use core::{
-    convert::TryInto,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
-#[cfg(feature = "hal")]
-use stm32_hal2::rng;
-
-use crate::{CanBitrate, CanError, PAYLOAD_SIZE_CONFIG_COMMON, USING_CYPHAL};
+use crate::{CanError, PAYLOAD_SIZE_CONFIG_COMMON};
 
 const MAX_RX_FRAMES_LEGACY: usize = 24;
 const MAX_RX_FRAMES_FD: usize = 3;
@@ -25,6 +19,7 @@ pub static RX_FRAME_I: AtomicUsize = AtomicUsize::new(0);
 
 /// This includes configuration data that we use on all nodes, and is not part of the official
 /// DroneCAN spec.
+#[cfg_attr(feature = "defmt", derive(Format))]
 pub struct ConfigCommon {
     /// Used to distinguish between multiple instances of this device. Stored in
     /// flash. If dyanmic id allocation is enabled, this is overwritten, but passed as
@@ -36,10 +31,10 @@ pub struct ConfigCommon {
     pub dynamic_id_allocation: bool,
     /// Ie, capable of 64-byte frame lens, vice 8.
     pub fd_mode: bool,
-    /// Kbps. If less than 1_000, arbitration and data bit rate are the same.
-    /// If greater than 1_000, arbitration bit rate stays at 1_000 due to protocol limits
-    /// while data bit rate is this value.
-    pub can_bitrate: CanBitrate,
+    // /// Kbps. If less than 1_000, arbitration and data bit rate are the same.
+    // /// If greater than 1_000, arbitration bit rate stays at 1_000 due to protocol limits
+    // /// while data bit rate is this value.
+    // pub can_bitrate: CanBitrate,
 }
 
 impl Default for ConfigCommon {
@@ -50,7 +45,7 @@ impl Default for ConfigCommon {
             node_id: 69,
             dynamic_id_allocation: true,
             fd_mode: false,
-            can_bitrate: CanBitrate::default(),
+            //            can_bitrate: CanBitrate::default(),
         }
     }
 }
@@ -61,7 +56,7 @@ impl ConfigCommon {
             node_id: buf[0],
             dynamic_id_allocation: buf[1] != 0,
             fd_mode: buf[2] != 0,
-            can_bitrate: buf[3].try_into().unwrap_or_default(),
+            //            can_bitrate: buf[3].try_into().unwrap_or_default(),
         }
     }
 
@@ -71,20 +66,14 @@ impl ConfigCommon {
         result[0] = self.node_id;
         result[1] = self.dynamic_id_allocation as u8;
         result[2] = self.fd_mode as u8;
-        result[3] = self.can_bitrate as u8;
+        //        result[3] = self.can_bitrate as u8;
 
         result
     }
 }
 
-/// Accounts for the slight difference in CAN ID layout between DroneCAN and Cyphal.
-#[derive(Clone, Copy)]
-pub enum Protocol {
-    DroneCan,
-    Cyphal,
-}
-
-#[derive(Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Clone, Copy)]
 /// Distinguish single and multi-part transfers. The inner value is the toggle value of the
 /// previous frame.
 pub enum TransferComponent {
@@ -105,7 +94,8 @@ pub enum TransferComponent {
 /// In multi-frame transfers, the value of the priority field shall be identical for all frames of the transfer.
 ///
 /// We use the Cyphal specification, due to its specificity.
-#[derive(Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MsgPriority {
     Exceptional,
     Immediate,
@@ -148,7 +138,8 @@ impl MsgPriority {
 }
 
 /// Differentiates between messages and services
-#[derive(PartialEq)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum FrameType {
     Message,
     MessageAnon,
@@ -156,12 +147,15 @@ pub enum FrameType {
 }
 
 /// Data present in services, but not messages.
-#[derive(PartialEq, Copy, Clone)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, PartialEq, Copy, Clone)]
 pub struct ServiceData {
     pub dest_node_id: u8, // 7 bits
     pub req_or_resp: RequestResponse,
 }
 
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Copy, Clone)]
 pub struct TailByte {
     pub start_of_transfer: bool,
     pub end_of_transfer: bool,
@@ -183,8 +177,6 @@ impl TailByte {
             // For single-frame transfers, the value of this field is always 0.
             // For multi-frame transfers, this field contains the value of the toggle bit. As specified
             // above this will alternate value between frames, starting at 0 for the first frame.
-            // Cyphal note: Behavior of this bit is reversed from DroneCAN. Ie it's 1 for single-frame,
-            // and first of multi-frame.
             | ((self.toggle as u8) << 5)
             | (self.transfer_id & 0b1_1111)
     }
@@ -242,7 +234,8 @@ pub const fn find_tail_byte_index(payload_len: u8) -> usize {
     63
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum RequestResponse {
     Request = 1,
@@ -260,6 +253,8 @@ pub enum RequestResponse {
 /// - Message type ID: Data type ID of the encoded message (16 bits)
 /// - Service not message: Always 0. 1 bit.
 /// - Source nod ID.Can be 1-27. 7 bits.
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub struct CanId {
     // Valid values for priority range from 0 to 31, inclusively, where 0 corresponds to highest
     // priority (and 31 corresponds to lowest priority).
@@ -278,32 +273,24 @@ pub struct CanId {
 }
 
 impl CanId {
+    /// Get the raw u32 value of the CanId as used in the frame
     pub fn value(&self) -> u32 {
-        // let on_cyphal = USING_CYPHAL.load(Ordering::Acquire);
-        let on_cyphal = false;
-
-        let mut message_type_id = self.type_id;
-        // Cyphal restricts message id to 13 bits.
-        let (priority_bits, priority_shift) = if on_cyphal {
-            message_type_id = message_type_id & 0b1_1111_1111_1111;
-
-            (self.priority.val() as u32 & 0b111, 26)
-        } else {
-            (self.priority.val() as u32 & 0b1_1111, 24)
-        };
-
-        // todo: for cyphal, bit 25 is 1 if a service transfer.
+        let (priority_bits, priority_shift) = (self.priority.val() as u32 & 0b1_1111, 24);
 
         // The `&` operations are to enforce the smaller-bit-count allowed than the datatype allows.
 
-        let mut frame_type_val = 0;
-
-        if let FrameType::Service(_) = self.frame_type {
-            frame_type_val = 1;
-        }
+        // let frame_type_val = if let FrameType::Service(ServiceData {
+        //     dest_node_id: _,
+        //     req_or_resp: RequestResponse::Request,
+        // }) = self.frame_type
+        // {
+        //     0x800000
+        // } else {
+        //     0
+        // };
 
         let mut result = (priority_bits << priority_shift)
-            | (frame_type_val << 7)
+//            | frame_type_val
             | ((self.source_node_id & 0b111_1111) as u32);
 
         // The middle 16 bits vary depending on frame type.
@@ -325,13 +312,9 @@ impl CanId {
             FrameType::Service(service_data) => {
                 result |= ((self.type_id as u32) << 16)
                     | ((service_data.req_or_resp as u8 as u32) << 15)
+                    | 0x80
                     | (((service_data.dest_node_id & 0b111_1111) as u32) << 8)
             }
-        }
-
-        // On cyphal, Bits 21 and 22 are 1 when transmitting.
-        if on_cyphal {
-            result |= 0b11 << 21;
         }
 
         result
@@ -346,31 +329,28 @@ impl CanId {
         let priority = MsgPriority::from_val((val >> 24) as u8 & 0b1_1111);
 
         let mut frame_type = FrameType::Message;
-        let mut type_id = 0;
 
-        match (val >> 7) & 1 {
+        let type_id: u16 = match (val >> 7) & 1 {
             0 => match source_node_id {
                 0 => {
                     frame_type = FrameType::MessageAnon;
-                    type_id = ((val >> 8) & 0b11) as u16;
+                    ((val >> 8) & 0b11) as u16
                 }
-                _ => {
-                    type_id = (val >> 8) as u16;
-                }
+                _ => (val >> 8) as u16,
             },
             1 => {
                 frame_type = FrameType::Service(ServiceData {
                     dest_node_id: ((val >> 8) & 0b111_1111) as u8,
-                    req_or_resp: if (val >> 15) == 1 {
+                    req_or_resp: if (val & 0x8000) == 0x8000 {
                         RequestResponse::Request
                     } else {
                         RequestResponse::Response
                     },
                 });
-                type_id = ((val >> 16) & 0xff) as u16;
+                ((val >> 16) & 0xff) as u16
             }
             _ => unreachable!(),
-        }
+        };
 
         Self {
             priority,
@@ -397,7 +377,6 @@ pub fn get_tail_byte(payload: &[u8], frame_len: u8) -> Result<TailByte, CanError
 /// - Transfer payload
 /// - 0 tail byte, which contains the following fields. Start of transfer (1 bit), End of transfer (1 bit)
 /// toggle bit (1 bit), Transfer id (5 bits)."
-/// Cyphal works in a similar way, but with ar reversed toggle bit.
 pub fn make_tail_byte(transfer_comonent: TransferComponent, transfer_id: u8) -> TailByte {
     // Defaults for a single-frame transfer using the DroneCAN spec..
     let mut start_of_transfer = true;
@@ -418,10 +397,6 @@ pub fn make_tail_byte(transfer_comonent: TransferComponent, transfer_id: u8) -> 
             toggle = !toggle_prev;
         }
         _ => (),
-    }
-
-    if USING_CYPHAL.load(Ordering::Acquire) {
-        toggle = !toggle;
     }
 
     TailByte {
@@ -587,4 +562,74 @@ pub fn handle_frame_rx(rx_buf: &[u8], payload: &mut [u8], fd_mode: bool) -> bool
     RX_FRAME_I.store(0, Ordering::Release);
 
     true
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_canid_msg_convert() {
+        let id1 = 0b0000_0001_0000_0011_1110_1000_0000_0001; // 0x103E801
+        let canid1 = CanId {
+            priority: MsgPriority::Immediate,
+            type_id: 1000,
+            source_node_id: 1,
+            frame_type: FrameType::Message,
+        };
+        let canid1_val = canid1.value();
+        assert_eq!(canid1_val, id1);
+        let reversed = CanId::from_value(canid1_val);
+        assert_eq!(canid1, reversed);
+    }
+
+    #[test]
+    fn test_canid_service_convert() {
+        let id1 = 0b0000_0001_0110_0101_1111_1111_1000_0010; // 0x165FF82
+        let canid1 = CanId {
+            priority: MsgPriority::Immediate,
+            type_id: 101,
+            source_node_id: 2,
+            frame_type: FrameType::Service(ServiceData {
+                dest_node_id: 127,
+                req_or_resp: RequestResponse::Request,
+            }),
+        };
+        let canid1_val = canid1.value();
+        assert_eq!(canid1_val, id1);
+        let reversed = CanId::from_value(canid1_val);
+        assert_eq!(canid1, reversed);
+        let id2 = 0b0000_0001_0110_0101_0000_0010_1111_1111; // 0x16502FF
+        let canid2 = CanId {
+            priority: MsgPriority::Immediate,
+            type_id: 101,
+            source_node_id: 127,
+            frame_type: FrameType::Service(ServiceData {
+                dest_node_id: 2,
+                req_or_resp: RequestResponse::Response,
+            }),
+        };
+        let canid2_val = canid2.value();
+        assert_eq!(canid2_val, id2);
+        let reversed = CanId::from_value(canid2_val);
+        assert_eq!(canid2, reversed);
+    }
+
+    // #[test]
+    // fn test_canid_anon_msg_convert() {
+    //     let id1 = 0b0000_0001_0110_0101_1111_1111_1000_0010; // 0x165FF82
+    //     let canid1 = CanId {
+    //         priority: MsgPriority::Immediate,
+    //         type_id: 101,
+    //         source_node_id: 2,
+    //         frame_type: FrameType::Service(ServiceData {
+    //             dest_node_id: 127,
+    //             req_or_resp: RequestResponse::Request,
+    //         }),
+    //     };
+    //     let canid1_val = canid1.value();
+    //     assert_eq!(canid1_val, id1);
+    //     let reversed = CanId::from_value(canid1_val);
+    //     assert_eq!(canid1, reversed);
+    // }
 }

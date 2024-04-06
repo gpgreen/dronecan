@@ -7,8 +7,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-fdcan = { version = "^0.2.0", optional = true }
-stm32-hal2 = { path = "../../stm32-hal", optional = true }
+#fdcan = { version = "^0.2.0", optional = true }
+embedded-can = "0.4.1"
 
 # To parse enums from their integer repr
 num_enum = { version = "^0.7.0", default_features = false }
@@ -22,15 +22,18 @@ defmt = { version = "0.3.4", optional = true }
 packed_struct = {version = "^0.10.1", default_features = false }
 # We use bitvec for serializing and deserializing standard DroneCan DSDL
 # types that use dynamic-sized arrays; these are unable to be tackled by PackedStruct.
-# This is mainly used for by the `GetSet` DSDL message.
 bitvec = { version = "1.0.1", default-features = false }
 
 # for f16 implementation, mimicking `half`'s.
 crunchy = "0.2.2"
+heapless = "0.8.0"
+log = "0.4.21"
 
 [features]
-hal = []
-hal_g431 = ["fdcan/fdcan_g0_g4_l5", "stm32-hal2/g431", "stm32-hal2/can_fd_g", "defmt", "hal"]
-hal_g473 = ["fdcan/fdcan_g0_g4_l5", "stm32-hal2/g473", "stm32-hal2/can_fd_g", "defmt", "hal"]
-hal_h7 = ["fdcan/fdcan_h7", "stm32-hal2/h743v", "stm32-hal2/can_fd_h", "defmt", "hal"]
-
+# use the defmt library
+defmt = ["dep:defmt"]
+# use the stm32
+#hal = ["dep:stm32-hal2","fdcan"]
+#hal_g431 = ["fdcan/fdcan_g0_g4_l5", "stm32-hal2/g431", "stm32-hal2/can_fd_g", "defmt", "hal"]
+#hal_g473 = ["fdcan/fdcan_g0_g4_l5", "stm32-hal2/g473", "stm32-hal2/can_fd_g", "defmt", "hal"]
+#hal_h7 = ["fdcan/fdcan_h7", "stm32-hal2/h743v", "stm32-hal2/can_fd_h", "defmt", "hal"]

@@ -1,8 +1,9 @@
 //! This module contains types associated with specific Dronecan messages.
 
-use crate::{f16, protocol::ConfigCommon, CanError, MsgType, PAYLOAD_SIZE_NODE_STATUS};
+use crate::{f16, protocol::ConfigCommon, CanError, MsgType};
 use bitvec::prelude::*;
 use heapless::{String, Vec};
+use log::*;
 
 #[cfg(feature = "defmt")]
 use defmt::*;
@@ -48,6 +49,7 @@ pub enum NodeHealth {
 
 impl From<u8> for NodeHealth {
     fn from(val: u8) -> Self {
+        debug!("node health:{}", val);
         match val {
             0 => NodeHealth::Ok,
             1 => NodeHealth::Warning,
@@ -72,15 +74,19 @@ pub enum NodeMode {
 
 impl From<u8> for NodeMode {
     fn from(val: u8) -> Self {
+        debug!("node mode:{}", val);
         match val {
             0 => NodeMode::Operational,
             1 => NodeMode::Initialization,
             2 => NodeMode::Maintenance,
             3 => NodeMode::SoftwareUpdate,
+            7 => NodeMode::Offline,
             _ => panic!(),
         }
     }
 }
+
+pub const PAYLOAD_SIZE_NODE_STATUS: usize = 7;
 
 /// Broadcast periodically, and sent as part of the Node Status message.
 #[cfg_attr(feature = "defmt", derive(Format))]
@@ -108,15 +114,133 @@ impl NodeStatus {
     }
     pub fn from_bytes(buf: &[u8]) -> Self {
         let bits = buf.view_bits::<Msb0>();
+        debug!("bits:{:?}", bits);
         let uptime_sec = bits[0..32].load_le();
-        let health = NodeHealth::from(bits[33..40].load::<u8>());
-        let mode = NodeMode::from(bits[41..48].load::<u8>());
-        let vendor_specific_status_code = bits[84..100].load_le();
+        let health = NodeHealth::from(bits[32..34].load::<u8>());
+        let mode = NodeMode::from(bits[34..37].load::<u8>());
+        let vendor_specific_status_code = bits[40..56].load_le();
         Self {
             uptime_sec,
             health,
             mode,
             vendor_specific_status_code,
+        }
+    }
+}
+
+pub const HARDWARE_VERSION_MAX_SIZE: usize = 19 + 255;
+
+/// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/HardwareVersion.uavcan
+/// Generic hardware version information.
+/// These values should remain unchanged for the device's lifetime.
+// pub struct HardwareVersion<'a> {
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HardwareVersion {
+    pub major: u8,
+    pub minor: u8,
+    /// Unique ID is a 128 bit long sequence that is globally unique for each node.
+    /// All zeros is not a valid UID.
+    /// If filled with zeros, assume that the value is undefined.
+    pub unique_id: [u8; 16],
+    // We currently don't use certificate of authority.
+    // /// Certificate of authenticity (COA) of the hardware, 255 bytes max.
+    pub certificate_of_authority: Option<Vec<u8, 255>>,
+}
+
+impl HardwareVersion {
+    /// serialize `HardwareVersion` to buffer
+    pub fn to_bytes(&self) -> Vec<u8, HARDWARE_VERSION_MAX_SIZE> {
+        let mut buf = Vec::new();
+        let _ = buf.resize_default(HARDWARE_VERSION_MAX_SIZE);
+        buf[0] = self.major;
+        buf[1] = self.minor;
+        buf[2..18].clone_from_slice(&self.unique_id);
+        // The final index is our 8-bit length field for COA, which we hard-set to 0.
+        if let Some(coa) = &self.certificate_of_authority {
+            buf[18] = coa.len() as u8;
+            buf[19..19 + coa.len()].copy_from_slice(coa.as_slice());
+            buf.truncate(19 + coa.len());
+        } else {
+            buf[18] = 0;
+            buf.truncate(19);
+        }
+        buf
+    }
+    /// construct `HardwareVersion` from buffer
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        let mut unique_id = [0; 16];
+        unique_id.copy_from_slice(&buf[2..18]);
+        let coa_len = buf[18];
+        let coa = if coa_len > 0 {
+            let mut v: Vec<u8, 255> = Vec::new();
+            v.extend_from_slice(&buf[19..19 + coa_len as usize])
+                .unwrap();
+            Some(v)
+        } else {
+            None
+        };
+        Self {
+            major: buf[0],
+            minor: buf[1],
+            unique_id,
+            certificate_of_authority: coa,
+        }
+    }
+    /// the size of the type in a buffer
+    pub fn buffer_size(&self) -> usize {
+        if let Some(coa) = &self.certificate_of_authority {
+            19 + coa.len()
+        } else {
+            19
+        }
+    }
+}
+
+pub const PAYLOAD_SIZE_SOFTWARE_VERSION: usize = 15;
+
+/// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/SoftwareVersion.uavcan
+/// Generic software version information.
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct SoftwareVersion {
+    pub major: u8,
+    pub minor: u8,
+    /// This mask indicates which optional fields (see below) are set.
+    /// u8 OPTIONAL_FIELD_FLAG_VCS_COMMIT = 1
+    /// u8 OPTIONAL_FIELD_FLAG_IMAGE_CRC = 2
+    pub optional_field_flags: u8,
+    /// VCS commit hash or revision number, e.g. git short commit hash. Optional.
+    pub vcs_commit: u32,
+    /// The value of an arbitrary hash function applied to the firmware image.
+    pub image_crc: u64,
+}
+
+impl SoftwareVersion {
+    /// serialize `SoftwareVersion` to a buffer
+    pub fn to_bytes(&self) -> [u8; PAYLOAD_SIZE_SOFTWARE_VERSION] {
+        let mut result = [0; 15];
+
+        result[0] = self.major;
+        result[1] = self.minor;
+        result[2] = self.optional_field_flags;
+        result[3..7].clone_from_slice(&self.vcs_commit.to_le_bytes());
+        result[7..15].clone_from_slice(&self.image_crc.to_le_bytes());
+
+        result
+    }
+
+    /// read `SoftwareVersion` from buffer
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        let bits = buf.view_bits::<Msb0>();
+        let vcs_commit = bits[24..56].load_le();
+        let image_crc = bits[56..120].load_le();
+        Self {
+            major: buf[0],
+            minor: buf[1],
+            optional_field_flags: buf[2],
+            vcs_commit,
+            image_crc,
         }
     }
 }
@@ -135,35 +259,39 @@ pub struct GetNodeInfoResponse {
 }
 
 impl GetNodeInfoResponse {
-    /// convert `GetNodeInfoResponse` to bytes
+    /// serialize `GetNodeInfoResponse` to buffer
     pub fn to_bytes(&self) -> Vec<u8, UAVCAN_PROTOCOL_GET_NODE_INFO_RESPONSE_MAX_SIZE> {
         let mut buf = Vec::new();
-
+        buf.resize_default(UAVCAN_PROTOCOL_GET_NODE_INFO_RESPONSE_MAX_SIZE)
+            .unwrap();
         // copy node status
         let ns = self.node_status.to_bytes();
-        buf.clone_from_slice(&ns);
+        buf[0..ns.len()].clone_from_slice(&ns);
         let mut start = ns.len();
 
         // copy sw version
         let sw = self.sw_version.to_bytes();
-        buf[start..].clone_from_slice(&sw);
+        buf[start..start + sw.len()].clone_from_slice(&sw);
         start += sw.len();
 
         // copy hw version
         let hw = self.hw_version.to_bytes();
-        buf[start..].clone_from_slice(&hw);
+        buf[start..start + hw.len()].clone_from_slice(&hw);
         start += hw.len();
-
+        debug!("hw start: {}", start);
         if self.name.len() > 80 {
             panic!();
         }
-        buf.push(self.name.len() as u8).ok();
+        buf[start] = self.name.len() as u8;
+        debug!("nm len: {}", buf[start]);
         start += 1;
-        buf[start..].clone_from_slice(self.name.as_bytes());
+        buf[start..start + self.name.len()].clone_from_slice(self.name.as_bytes());
+        buf.truncate(start + self.name.len());
+        debug!("getnodeinforesponse buf: {:?}", buf);
         buf
     }
 
-    /// return `GetNodeInfoResponse` from payload data
+    /// construct `GetNodeInfoResponse` from buffer
     pub fn from_bytes(buf: &[u8]) -> Self {
         let mut start = 0;
         let node_status = NodeStatus::from_bytes(&buf[start..PAYLOAD_SIZE_NODE_STATUS]);
@@ -171,14 +299,14 @@ impl GetNodeInfoResponse {
         let sw_version =
             SoftwareVersion::from_bytes(&buf[start..start + PAYLOAD_SIZE_SOFTWARE_VERSION]);
         start += PAYLOAD_SIZE_SOFTWARE_VERSION;
-        let hw_version =
-            HardwareVersion::from_bytes(&buf[start..start + PAYLOAD_SIZE_HARDWARE_VERSION]);
-        start += PAYLOAD_SIZE_HARDWARE_VERSION;
+        let hw_version = HardwareVersion::from_bytes(&buf[start..]);
+        start += hw_version.buffer_size();
         let name_len = buf[start];
+        debug!("name len: {}", name_len);
         start += 1;
         let mut v = Vec::new();
-        v.extend_from_slice(&buf[start..start + name_len as usize])
-            .ok();
+        let _ = v.extend_from_slice(&buf[start..start + name_len as usize]);
+        debug!("v:{:?}", v);
         let name = String::from_utf8(v).unwrap();
         Self {
             node_status,
@@ -561,94 +689,6 @@ impl<'a> GetSetResponse<'a> {
     }
 }
 
-pub const PAYLOAD_SIZE_HARDWARE_VERSION: usize = 19;
-
-/// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/HardwareVersion.uavcan
-/// Generic hardware version information.
-/// These values should remain unchanged for the device's lifetime.
-// pub struct HardwareVersion<'a> {
-#[cfg_attr(feature = "defmt", derive(Format))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HardwareVersion {
-    pub major: u8,
-    pub minor: u8,
-    /// Unique ID is a 128 bit long sequence that is globally unique for each node.
-    /// All zeros is not a valid UID.
-    /// If filled with zeros, assume that the value is undefined.
-    pub unique_id: [u8; 16],
-    // We currently don't use certificate of authority.
-    // /// Certificate of authenticity (COA) of the hardware, 255 bytes max.
-    // pub certificate_of_authority: &'a [u8],
-}
-
-impl HardwareVersion {
-    pub fn to_bytes(&self) -> [u8; PAYLOAD_SIZE_HARDWARE_VERSION] {
-        let mut buf = [0; PAYLOAD_SIZE_HARDWARE_VERSION];
-
-        buf[0] = self.major;
-        buf[1] = self.minor;
-        buf[2..18].clone_from_slice(&self.unique_id);
-        // The final index is our 8-bit length field for COA, which we hard-set to 0.
-        buf[18] = 0;
-        buf
-    }
-    pub fn from_bytes(buf: &[u8]) -> Self {
-        let mut unique_id = [0; 16];
-        unique_id.copy_from_slice(&buf[2..18]);
-        Self {
-            major: buf[0],
-            minor: buf[1],
-            unique_id,
-        }
-    }
-}
-
-pub const PAYLOAD_SIZE_SOFTWARE_VERSION: usize = 15;
-
-/// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/SoftwareVersion.uavcan
-/// Generic software version information.
-#[cfg_attr(feature = "defmt", derive(Format))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SoftwareVersion {
-    pub major: u8,
-    pub minor: u8,
-    ///This mask indicates which optional fields (see below) are set.
-    /// uint8 OPTIONAL_FIELD_FLAG_VCS_COMMIT = 1
-    ///uint8 OPTIONAL_FIELD_FLAG_IMAGE_CRC  = 2
-    pub optional_field_flags: u8,
-    /// VCS commit hash or revision number, e.g. git short commit hash. Optional.
-    pub vcs_commit: u32,
-    /// The value of an arbitrary hash function applied to the firmware image.
-    pub image_crc: u64,
-}
-
-impl SoftwareVersion {
-    pub fn to_bytes(&self) -> [u8; PAYLOAD_SIZE_SOFTWARE_VERSION] {
-        let mut result = [0; 15];
-
-        result[0] = self.major;
-        result[1] = self.minor;
-        result[2] = self.optional_field_flags;
-        result[3..7].clone_from_slice(&self.vcs_commit.to_le_bytes());
-        result[7..15].clone_from_slice(&self.image_crc.to_le_bytes());
-
-        result
-    }
-
-    pub fn from_bytes(buf: &[u8]) -> Self {
-        let bits = buf.view_bits::<Msb0>();
-        let vcs_commit = bits[24..56].load_le();
-        let image_crc = bits[57..114].load_le();
-        Self {
-            major: buf[0],
-            minor: buf[1],
-            optional_field_flags: buf[2],
-            vcs_commit,
-            image_crc,
-        }
-    }
-}
-
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/DataTypeKind.uavcan
 #[cfg_attr(feature = "defmt", derive(Format))]
 #[derive(Debug, Clone, Copy)]
@@ -815,8 +855,10 @@ pub struct AhrsSolution {
 }
 
 impl AhrsSolution {
-    /// convert `AhrsSolution` to bytes
-    pub fn to_bytes(&self, buf: &mut Vec<u8, UAVCAN_EQUIPMENT_AHRS_SOLUTION_MAX_SIZE>) {
+    /// serialize `AhrsSolution` to buffer
+    pub fn to_bytes(&self) -> Vec<u8, UAVCAN_EQUIPMENT_AHRS_SOLUTION_MAX_SIZE> {
+        let mut buf = Vec::new();
+
         // fill the buffer with zero's to the max length
         buf.resize_default(UAVCAN_EQUIPMENT_AHRS_SOLUTION_MAX_SIZE)
             .ok();
@@ -893,9 +935,10 @@ impl AhrsSolution {
 
         // resize buf back to actual length
         buf.truncate(bit_index / 8);
+        buf
     }
 
-    /// return AhrsSolution from payload data
+    /// construct AhrsSolution from buffer
     pub fn from_bytes(buf: &[u8]) -> Self {
         // timestamp is stored as 7 bytes, the final byte for a u64 in le order is assumed to be zero
         let mut tsbuf: [u8; 8] = [0; 8];
@@ -1012,6 +1055,7 @@ impl AhrsSolution {
 #[cfg(test)]
 mod test {
     use super::*;
+    use test_log::test;
 
     #[test]
     fn test_ahrs_solution_no_covar() {
@@ -1024,8 +1068,7 @@ mod test {
             linear_acceleration: [0.0, 1.0, 2.0],
             linear_acceleration_covariance: Covariance::default(),
         };
-        let mut sol1_buf = Vec::new();
-        sol1.to_bytes(&mut sol1_buf);
+        let sol1_buf = sol1.to_bytes();
         assert_eq!(sol1_buf.len(), 30);
         let sol2 = AhrsSolution::from_bytes(sol1_buf.as_slice());
         assert_eq!(sol2, sol1);
@@ -1048,15 +1091,59 @@ mod test {
                 data: Vec::from_slice(&[0.0, 1.0, 2.0]).unwrap(),
             },
         };
-        let mut sol1_buf = Vec::new();
-        sol1.to_bytes(&mut sol1_buf);
+        let sol1_buf = sol1.to_bytes();
         assert_eq!(sol1_buf.len(), 48);
         let sol2 = AhrsSolution::from_bytes(sol1_buf.as_slice());
         assert_eq!(sol2, sol1);
     }
 
     #[test]
+    fn test_software_version() {
+        let sw1 = SoftwareVersion {
+            major: 1,
+            minor: 1,
+            optional_field_flags: 0x3,
+            vcs_commit: 2344,
+            image_crc: u64::MAX,
+        };
+        let buf1 = sw1.to_bytes();
+        let sw2 = SoftwareVersion::from_bytes(&buf1);
+        assert_eq!(sw1, sw2);
+    }
+
+    #[test]
+    fn test_hardware_version() {
+        let hw1 = HardwareVersion {
+            major: 2,
+            minor: 2,
+            unique_id: [
+                0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf, 0x10,
+            ],
+            certificate_of_authority: None,
+        };
+        let buf1 = hw1.to_bytes();
+        let hw2 = HardwareVersion::from_bytes(&buf1);
+        assert_eq!(hw1, hw2);
+        let mut coa = Vec::new();
+        let _ = coa.resize_default(5);
+        coa[0..5].copy_from_slice(&[0x1, 0x2, 0x3, 0x4, 0x5]);
+        let hw2 = HardwareVersion {
+            major: 2,
+            minor: 2,
+            unique_id: [
+                0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf, 0x10,
+            ],
+            certificate_of_authority: Some(coa),
+        };
+        let buf1 = hw2.to_bytes();
+        let hw3 = HardwareVersion::from_bytes(&buf1);
+        assert_eq!(hw2, hw3);
+    }
+
+    #[test]
     fn test_get_node_info_response() {
+        let name = String::try_from("test_get_node_info_response").unwrap();
+        let nmlen = name.len();
         let sol1 = GetNodeInfoResponse {
             node_status: NodeStatus {
                 uptime_sec: 1,
@@ -1077,11 +1164,15 @@ mod test {
                 unique_id: [
                     0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf, 0x10,
                 ],
+                certificate_of_authority: None,
             },
-            name: String::from(b"test_get_node_info_response"),
+            name,
         };
         let gnir_buf = sol1.to_bytes();
-        assert_eq!(gnir_buf.len(), 48);
+        assert_eq!(
+            gnir_buf.len(),
+            UAVCAN_PROTOCOL_GET_NODE_INFO_RESPONSE_MAX_SIZE - 80 + nmlen - 255
+        );
         let sol2 = GetNodeInfoResponse::from_bytes(gnir_buf.as_slice());
         assert_eq!(sol2, sol1);
     }

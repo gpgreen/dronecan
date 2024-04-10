@@ -7,16 +7,10 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-#fdcan = { version = "^0.2.0", optional = true }
 embedded-can = "0.4.1"
-
-# To parse enums from their integer repr
-num_enum = { version = "^0.7.0", default_features = false }
-num-traits = { version = "^0.2.15", default_features = false } # Rounding.
-
-nb = "^1.1.0"  # For use with Fdcan lib's infallible type.
-
 defmt = { version = "0.3.4", optional = true }
+heapless = "0.8.0"
+log = "0.4.21"
 
 # For the tightly-packed and many-fielded Fix2.
 packed_struct = {version = "^0.10.1", default_features = false }
@@ -26,14 +20,10 @@ bitvec = { version = "1.0.1", default-features = false }
 
 # for f16 implementation, mimicking `half`'s.
 crunchy = "0.2.2"
-heapless = "0.8.0"
-log = "0.4.21"
+
+[dev-dependencies]
+test-log = "0.2.15"
 
 [features]
 # use the defmt library
 defmt = ["dep:defmt"]
-# use the stm32
-#hal = ["dep:stm32-hal2","fdcan"]
-#hal_g431 = ["fdcan/fdcan_g0_g4_l5", "stm32-hal2/g431", "stm32-hal2/can_fd_g", "defmt", "hal"]
-#hal_g473 = ["fdcan/fdcan_g0_g4_l5", "stm32-hal2/g473", "stm32-hal2/can_fd_g", "defmt", "hal"]
-#hal_h7 = ["fdcan/fdcan_h7", "stm32-hal2/h743v", "stm32-hal2/can_fd_h", "defmt", "hal"]

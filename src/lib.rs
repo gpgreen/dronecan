@@ -12,6 +12,7 @@ pub mod broadcast;
 mod crc;
 pub mod dsdl;
 pub mod gnss;
+pub mod interface;
 pub mod messages;
 pub mod protocol;
 
@@ -21,9 +22,6 @@ pub use messages::*;
 pub use protocol::*;
 
 pub const PAYLOAD_SIZE_CONFIG_COMMON: usize = 4;
-
-// Unfortunately, it seems we can't satisfy static allocation using const *methods*.
-pub const PAYLOAD_SIZE_NODE_STATUS: usize = 7;
 
 pub const NODE_STATUS_BROADCAST_PERIOD: f32 = 1.; // In s. Between 2 and 1000.
 
@@ -39,7 +37,7 @@ pub fn bit_size_to_byte_size(len_bits: usize) -> usize {
 }
 
 #[cfg_attr(feature = "defmt", derive(Format))]
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum CanError {
     Hardware,
     PayloadSize,
@@ -47,6 +45,8 @@ pub enum CanError {
     PayloadData,
     TransmitQueueFull,
     TransferMapFull,
+    RxPayloadBufferFull,
+    TxPayloadBufferFull,
 }
 
 /// 16-bit floating point

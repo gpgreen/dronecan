@@ -9,8 +9,8 @@ use crate::{MsgPriority, PAYLOAD_SIZE_CONFIG_COMMON, PAYLOAD_SIZE_NODE_STATUS};
 
 pub struct ParseError {}
 
-// #[repr(u16)]
-#[derive(Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MsgType {
     IdAllocation,
     GetNodeInfo,
@@ -97,7 +97,7 @@ impl MsgType {
         }
     }
 
-    /// Inverse of `id`, nothing that when there is a shared ID, choose one variant arbitrarily.
+    /// Inverse of `id`, noting that when there is a shared ID, choose one variant arbitrarily.
     pub const fn from_id(id: u16) -> Result<Self, ParseError> {
         Ok(match id {
             1 => Self::IdAllocation,
@@ -204,11 +204,6 @@ impl MsgType {
             Self::PowerSupplyStatus => 6,
             // Self::LinkStatsAnyleaf => 3,
         }
-    }
-
-    /// Includes payload size, padded for a tail byte.
-    pub const fn buf_size(&self) -> usize {
-        crate::find_tail_byte_index(self.payload_size()) + 1
     }
 
     // .base_crc in Pydronecan

@@ -1,21 +1,4 @@
-use core::sync::atomic::{AtomicUsize, Ordering};
-
 use crate::{CanError, PAYLOAD_SIZE_CONFIG_COMMON};
-
-const MAX_RX_FRAMES_LEGACY: usize = 24;
-const MAX_RX_FRAMES_FD: usize = 3;
-
-// This one may be accessed by applications directly.
-pub static mut MULTI_FRAME_BUFS_RX_LEGACY: [[u8; 8]; MAX_RX_FRAMES_LEGACY] =
-    [[0; 8]; MAX_RX_FRAMES_LEGACY];
-pub static mut MULTI_FRAME_BUFS_RX_FD: [[u8; 64]; MAX_RX_FRAMES_FD] = [[0; 64]; MAX_RX_FRAMES_FD];
-
-// todo: DRY from braodcast
-pub(crate) const DATA_FRAME_MAX_LEN_FD: u8 = 64;
-pub(crate) const DATA_FRAME_MAX_LEN_LEGACY: u8 = 8;
-
-// Used to identify the next frame to load.
-pub static RX_FRAME_I: AtomicUsize = AtomicUsize::new(0);
 
 /// This includes configuration data that we use on all nodes, and is not part of the official
 /// DroneCAN spec.
@@ -198,6 +181,38 @@ impl TailByte {
             start_of_transfer: start != 0,
         }
     }
+
+    /// Construct a tail byte. See DroneCAN Spec, CAN bus transport layer.
+    /// https://dronecan.github.io/Specification/4._CAN_bus_transport_layer/
+    /// "The Data field of the CAN frame is shared between the following fields:
+    /// - Transfer payload
+    /// - 0 tail byte, which contains the following fields. Start of transfer (1 bit), End of transfer (1 bit)
+    /// toggle bit (1 bit), Transfer id (5 bits)."
+    pub fn new(transfer_component: TransferComponent, transfer_id: u8) -> Self {
+        let (start_of_transfer, end_of_transfer, toggle) = match transfer_component {
+            TransferComponent::SingleFrame => (true, true, false),
+            TransferComponent::MultiStart => (true, false, false),
+            TransferComponent::MultiMid(toggle_prev) => (false, false, !toggle_prev),
+            TransferComponent::MultiEnd(toggle_prev) => (false, true, !toggle_prev),
+        };
+
+        TailByte {
+            start_of_transfer,
+            end_of_transfer,
+            toggle,
+            transfer_id,
+        }
+    }
+
+    pub fn get_tail_byte(payload: &[u8], frame_len: u8) -> Result<TailByte, CanError> {
+        let i = find_tail_byte_index(frame_len);
+
+        if i > payload.len() {
+            return Err(CanError::PayloadSize);
+        }
+
+        Ok(TailByte::from_value(payload[i]))
+    }
 }
 
 /// Determine the index for placing the tail byte of the payload. This procedure doesn't appear to
@@ -359,209 +374,6 @@ impl CanId {
             frame_type,
         }
     }
-}
-
-pub fn get_tail_byte(payload: &[u8], frame_len: u8) -> Result<TailByte, CanError> {
-    let i = find_tail_byte_index(frame_len);
-
-    if i > payload.len() {
-        return Err(CanError::PayloadSize);
-    }
-
-    Ok(TailByte::from_value(payload[i]))
-}
-
-/// Construct a tail byte. See DroneCAN Spec, CAN bus transport layer.
-/// https://dronecan.github.io/Specification/4._CAN_bus_transport_layer/
-/// "The Data field of the CAN frame is shared between the following fields:
-/// - Transfer payload
-/// - 0 tail byte, which contains the following fields. Start of transfer (1 bit), End of transfer (1 bit)
-/// toggle bit (1 bit), Transfer id (5 bits)."
-pub fn make_tail_byte(transfer_comonent: TransferComponent, transfer_id: u8) -> TailByte {
-    // Defaults for a single-frame transfer using the DroneCAN spec..
-    let mut start_of_transfer = true;
-    let mut end_of_transfer = true;
-    let mut toggle = false;
-
-    match transfer_comonent {
-        TransferComponent::MultiStart => {
-            end_of_transfer = false;
-        }
-        TransferComponent::MultiMid(toggle_prev) => {
-            start_of_transfer = false;
-            end_of_transfer = false;
-            toggle = !toggle_prev;
-        }
-        TransferComponent::MultiEnd(toggle_prev) => {
-            start_of_transfer = false;
-            toggle = !toggle_prev;
-        }
-        _ => (),
-    }
-
-    TailByte {
-        start_of_transfer,
-        end_of_transfer,
-        toggle,
-        transfer_id,
-    }
-}
-
-/// Handle a new received frame. This returns true, and fills `payload` with the assembled payload
-/// if this is the last frame in a multi-frame transfer, or if it's a single-frame transfer.
-/// Returns false and doesn't modify the buffer if part of a multi-frame payload, but adjusts
-/// some atomic state variables as-required.
-pub fn handle_frame_rx(rx_buf: &[u8], payload: &mut [u8], fd_mode: bool) -> bool {
-    let frame_i = RX_FRAME_I.fetch_add(1, Ordering::Relaxed);
-
-    let mut single_frame_payload = false;
-    let mut rx_frame_complete = false;
-
-    let frame_len = if fd_mode {
-        DATA_FRAME_MAX_LEN_FD
-    } else {
-        DATA_FRAME_MAX_LEN_LEGACY
-    } as usize;
-
-    let mut tail_byte_i = frame_len - 1;
-
-    // If the value at the tail byte index is 0, this is the final frame in the sequence (or a
-    // single-frame payload).
-    if rx_buf[tail_byte_i] == 0 {
-        // The last frame. Locate and parse the tail byte, so we know if this was a single-frame
-        // transfer.
-        for i in 0..frame_len {
-            // Read from the end, towards the front.
-            let i_word = (frame_len - 1) - i;
-            if rx_buf[i_word] != 0 {
-                // We update the tail byte index so we know not to include it in the compiled payload
-                // if this is the last frame.
-                tail_byte_i = i_word;
-                let tail_byte = TailByte::from_value(rx_buf[tail_byte_i]);
-                if tail_byte.end_of_transfer {
-                    rx_frame_complete = true;
-                    if tail_byte.start_of_transfer {
-                        single_frame_payload = true;
-                    }
-                    break;
-                } else {
-                    break;
-                }
-            }
-        }
-    } else {
-        // Check the end of the frame for the tail byte.
-        // todo: DRY with above tail byte check.
-        let tail_byte = TailByte::from_value(rx_buf[tail_byte_i]);
-        if tail_byte.end_of_transfer {
-            rx_frame_complete = true;
-            if tail_byte.start_of_transfer {
-                single_frame_payload = true;
-            }
-        }
-    }
-
-    // If we aren't at the end of the frame, load the data into our static buffer, and return false.
-    if !rx_frame_complete {
-        unsafe {
-            if fd_mode {
-                if frame_i < MULTI_FRAME_BUFS_RX_FD.len() {
-                    MULTI_FRAME_BUFS_RX_FD[frame_i][..frame_len]
-                        .clone_from_slice(&rx_buf[..frame_len]);
-                }
-            } else if frame_i < MULTI_FRAME_BUFS_RX_LEGACY.len() {
-                MULTI_FRAME_BUFS_RX_LEGACY[frame_i][..frame_len]
-                    .clone_from_slice(&rx_buf[..frame_len]);
-            }
-        }
-        return false;
-    }
-
-    // If it's a single-frame payload, don't bother loading data into the static buffer.
-    if single_frame_payload {
-        payload[..tail_byte_i].clone_from_slice(&rx_buf[..tail_byte_i]);
-        RX_FRAME_I.store(0, Ordering::Release);
-        return true;
-    }
-
-    // If we are at the end of a multi-frame payload, compile the frame from parts, and return true.
-
-    let mut payload_i = 0;
-
-    // Reset `tail_byte_i`; may have been altered during our previous use of it.
-    let tail_byte_i = frame_len - 1;
-    // todo: This currently does not verify CRC.
-
-    // todo: Nasty DRY here for switching buf; figure it out.
-    if fd_mode {
-        for (frame_i, frame_buf) in unsafe { MULTI_FRAME_BUFS_RX_FD }.iter().enumerate() {
-            let mut frame_empty = true;
-
-            // We use a `frame_buf` slice here since for non-FD, we still are usign 64-frame size.
-            for (word_i, word) in frame_buf[..frame_len].iter().enumerate() {
-                if payload_i >= payload.len() - 1 {
-                    break;
-                }
-
-                if *word != 0 {
-                    frame_empty = false;
-                }
-
-                if (frame_i == 0 && (word_i == 0 || word_i == 1)) || word_i == tail_byte_i {
-                    // the first two bytes are the CRC; not part of the payload.
-                    // The last in each frame (except for the last frame) is the tail byte.
-                    continue;
-                }
-
-                payload[payload_i] = *word;
-                payload_i += 1;
-            }
-
-            if frame_empty {
-                break;
-            }
-        }
-    } else {
-        for (frame_i, frame_buf) in unsafe { MULTI_FRAME_BUFS_RX_LEGACY }.iter().enumerate() {
-            let mut frame_empty = true;
-            for (word_i, word) in frame_buf[0..frame_len].iter().enumerate() {
-                if payload_i >= payload.len() - 1 {
-                    break;
-                }
-
-                if *word != 0 {
-                    frame_empty = false;
-                }
-
-                if (frame_i == 0 && (word_i == 0 || word_i == 1)) || word_i == tail_byte_i {
-                    continue;
-                }
-
-                payload[payload_i] = *word;
-                payload_i += 1;
-            }
-
-            if frame_empty {
-                break;
-            }
-        }
-    }
-
-    // These must match that defined initially.
-    unsafe {
-        if fd_mode {
-            MULTI_FRAME_BUFS_RX_FD = [[0; 64]; MAX_RX_FRAMES_FD];
-        } else {
-            MULTI_FRAME_BUFS_RX_LEGACY = [[0; 8]; MAX_RX_FRAMES_LEGACY];
-        }
-    }
-    // Zero-out for next use.
-    // *frame_bufs = [[0; 64]; 20];
-    // *frame_bufs = [[0; 8]; 20];
-
-    RX_FRAME_I.store(0, Ordering::Release);
-
-    true
 }
 
 #[cfg(test)]

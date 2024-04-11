@@ -3,7 +3,7 @@
 use crate::{f16, protocol::ConfigCommon, CanError, MsgType};
 use bitvec::prelude::*;
 use heapless::{String, Vec};
-use log::*;
+//use log::*;
 
 #[cfg(feature = "defmt")]
 use defmt::*;
@@ -49,7 +49,6 @@ pub enum NodeHealth {
 
 impl From<u8> for NodeHealth {
     fn from(val: u8) -> Self {
-        debug!("node health:{}", val);
         match val {
             0 => NodeHealth::Ok,
             1 => NodeHealth::Warning,
@@ -74,7 +73,6 @@ pub enum NodeMode {
 
 impl From<u8> for NodeMode {
     fn from(val: u8) -> Self {
-        debug!("node mode:{}", val);
         match val {
             0 => NodeMode::Operational,
             1 => NodeMode::Initialization,
@@ -114,7 +112,6 @@ impl NodeStatus {
     }
     pub fn from_bytes(buf: &[u8]) -> Self {
         let bits = buf.view_bits::<Msb0>();
-        debug!("bits:{:?}", bits);
         let uptime_sec = bits[0..32].load_le();
         let health = NodeHealth::from(bits[32..34].load::<u8>());
         let mode = NodeMode::from(bits[34..37].load::<u8>());
@@ -278,16 +275,13 @@ impl GetNodeInfoResponse {
         let hw = self.hw_version.to_bytes();
         buf[start..start + hw.len()].clone_from_slice(&hw);
         start += hw.len();
-        debug!("hw start: {}", start);
         if self.name.len() > 80 {
             panic!();
         }
         buf[start] = self.name.len() as u8;
-        debug!("nm len: {}", buf[start]);
         start += 1;
         buf[start..start + self.name.len()].clone_from_slice(self.name.as_bytes());
         buf.truncate(start + self.name.len());
-        debug!("getnodeinforesponse buf: {:?}", buf);
         buf
     }
 
@@ -302,11 +296,9 @@ impl GetNodeInfoResponse {
         let hw_version = HardwareVersion::from_bytes(&buf[start..]);
         start += hw_version.buffer_size();
         let name_len = buf[start];
-        debug!("name len: {}", name_len);
         start += 1;
         let mut v = Vec::new();
         let _ = v.extend_from_slice(&buf[start..start + name_len as usize]);
-        debug!("v:{:?}", v);
         let name = String::from_utf8(v).unwrap();
         Self {
             node_status,

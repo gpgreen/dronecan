@@ -18,6 +18,7 @@ pub mod protocol;
 
 pub use broadcast::*;
 pub use dsdl::*;
+pub use interface::*;
 pub use messages::*;
 pub use protocol::*;
 
@@ -222,5 +223,16 @@ impl f16 {
 
     pub fn as_u16(&self) -> u16 {
         self.bits
+    }
+}
+
+#[cfg(test)]
+mod test {
+    //    use super::*;
+    use test_log::test;
+
+    #[test]
+    fn test_it() {
+        assert!(true);
     }
 }

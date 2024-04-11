@@ -1,13 +1,5 @@
-# Rust library for DroneCAN and Cyphal, for use on CAN node MCUs.
+# Rust library for DroneCAN, for use on CAN node MCUs.
 
-Forked from https://github.com/David-OConnor/dronecan.git
-
-Altered to use SocketCAN
-
-Original:
-
-Hardware functionality is currently hard-coded to the [fdcan driver crate](https://docs.rs/fdcan/latest/fdcan/)
-and STM32-HAL.
+Originally Forked from https://github.com/David-OConnor/dronecan.git
 
 [Relevant section of DroneCAN specification](https://dronecan.github.io/Specification/4._CAN_bus_transport_layer/)
-[Cyphal specification](https://opencyphal.org/specification/Cyphal_Specification.pdf)

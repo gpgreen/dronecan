@@ -1,5 +1,5 @@
 [package]
-authors = ["David O'Connor <the_alchemist@fastmail.com>"]
+authors = ["Greg Green <ggreen@bit-builder.com>", "David O'Connor <the_alchemist@fastmail.com>"]
 name = "dronecan"
 version = "0.1.0"
 edition = "2021"

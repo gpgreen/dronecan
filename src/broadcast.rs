@@ -9,7 +9,7 @@ use crate::{
     gnss::{FixDronecan, GlobalNavSolution, GnssAuxiliary},
     interface::Uavcan,
     messages::MsgType,
-    protocol::{CanId, FrameType, RequestResponse, ServiceData, TailByte, TransferComponent},
+    protocol::{FrameType, RequestResponse, ServiceData},
     CanError,
 };
 use embedded_can;
@@ -46,10 +46,6 @@ static mut BUF_ACTUATOR_ARRAY_COMMAND: [u8; ACTUATOR_COMMAND_SIZE * 4] =
 static mut BUF_ARDUPILOT_GNSS_STATUS: [u8; 8] = [0; 8];
 static mut BUF_CIRCUIT_STATUS: [u8; 8] = [0; 8];
 static mut BUF_POWER_SUPPLY_STATUS: [u8; 8] = [0; 8];
-
-// Per DC spec.
-pub const NODE_ID_MIN_VALUE: u8 = 1;
-pub const NODE_ID_MAX_VALUE: u8 = 127;
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/341.NodeStatus.uavcan
 /// Standard data type: uavcan.protocol.NodeStatus
@@ -423,7 +419,7 @@ where
 /// The requester increments the index starting at 0 to poll parameters available.
 pub fn publish_getset_resp<CAN, FRAME>(
     can: &mut Uavcan<CAN, FRAME>,
-    data: &GetSetResponse,
+    _data: &GetSetResponse,
     node_id: u8,
     requester_node_id: u8,
 ) -> Result<(), CanError>
@@ -598,7 +594,7 @@ where
 
     let m_type = MsgType::ActuatorArrayCommand;
 
-    let mut payload_len = ACTUATOR_COMMAND_SIZE * commands.len();
+    let _payload_len = ACTUATOR_COMMAND_SIZE * commands.len();
 
     let mut i = 0;
     for command in commands {

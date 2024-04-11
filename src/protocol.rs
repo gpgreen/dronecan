@@ -1,5 +1,9 @@
 use crate::{CanError, PAYLOAD_SIZE_CONFIG_COMMON};
 
+// Per DC spec.
+pub const NODE_ID_MIN_VALUE: u8 = 1;
+pub const NODE_ID_MAX_VALUE: u8 = 127;
+
 /// This includes configuration data that we use on all nodes, and is not part of the official
 /// DroneCAN spec.
 #[cfg_attr(feature = "defmt", derive(Format))]
@@ -55,10 +59,10 @@ impl ConfigCommon {
     }
 }
 
-#[cfg_attr(feature = "defmt", derive(Format))]
-#[derive(Debug, Clone, Copy)]
 /// Distinguish single and multi-part transfers. The inner value is the toggle value of the
 /// previous frame.
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Clone, Copy)]
 pub enum TransferComponent {
     SingleFrame,
     MultiStart,

@@ -1,28 +1,19 @@
-//! This module contains code related to broadcasting messages over CAN.
+//! This module contains code related to sending and receiving DroneCAN frames over CAN.
 
 use crate::{
     crc::TransferCrc,
-    find_tail_byte_index,
     messages::MsgType,
     protocol::{CanId, FrameType, RequestResponse, TailByte, TransferComponent},
     CanError,
 };
+use bitvec::prelude::*;
 use embedded_can;
 use heapless::{Deque, Entry, FnvIndexMap, Vec};
 use log::*;
 
-// Note: These are only capable of handling one message at a time. This is especially notable
-// for reception.
-static mut MULTI_FRAME_BUFS_TX: [[u8; 64]; 20] = [[0; 64]; 20];
-
 pub(crate) const DATA_FRAME_MAX_LEN_LEGACY: usize = 8;
-
 pub(crate) const MAX_RX_FRAMES_LEGACY: usize = 24;
-pub(crate) const RX_BUFFER_MAX_SIZE: usize = MAX_RX_FRAMES_LEGACY * DATA_FRAME_MAX_LEN_LEGACY;
-
-// Per DC spec.
-pub const NODE_ID_MIN_VALUE: u8 = 1;
-pub const NODE_ID_MAX_VALUE: u8 = 127;
+pub(crate) const RX_TX_BUFFER_MAX_SIZE: usize = MAX_RX_FRAMES_LEGACY * DATA_FRAME_MAX_LEN_LEGACY;
 
 /// The key for a map entry to `TransferDesc`
 #[cfg_attr(feature = "defmt", derive(Format))]
@@ -56,7 +47,7 @@ pub struct TransferDesc {
     next_toggle_bit: bool,
     ts: u64,
     iface_index: usize,
-    payload: Vec<u8, RX_BUFFER_MAX_SIZE>,
+    payload: Vec<u8, RX_TX_BUFFER_MAX_SIZE>,
 }
 
 impl TransferDesc {
@@ -89,6 +80,22 @@ impl TransferDesc {
         self.transfer_id &= 0b1_1111;
         id
     }
+}
+
+/// The `RxPayload` contains state for a completed transfer
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RxPayload<'a> {
+    /// The `CanId` of the payload
+    pub id: CanId,
+    /// Transfer number for this payload
+    pub transfer_id: u8,
+    /// timestamp at beginning of payload
+    pub ts: u64,
+    /// If a multi-frame payload, this is the crc
+    pub payload_crc: Option<u16>,
+    /// the payload in bytes
+    pub payload: &'a [u8],
 }
 
 /// Broadcast struct for Uavcan on CAN interface
@@ -146,7 +153,7 @@ where
         payload: &[u8],
     ) -> Result<(), CanError> {
         debug!(
-            "broadcast frame:{:?} msg_type:{:?} source node:{} payload len: {}",
+            "broadcast frame:{:?} msg_type:{:?} source node:{} payload len:{}",
             frame_type,
             msg_type,
             source_node_id,
@@ -176,7 +183,7 @@ where
             Some(t) => Ok(t),
             None => panic!(),
         }?;
-        trace!("descriptor start state: {:?}", txf_desc);
+        trace!("descriptor start state:{:?}", txf_desc);
 
         // if this is a service reply, use the existing transfer id, otherwise, increment and
         // use that.
@@ -190,8 +197,7 @@ where
             }
             _ => txf_desc.transfer_id_then_incr(),
         };
-        // reset the tx buffer
-        txf_desc.payload.clear();
+        trace!("descriptor updated state:{:?}", txf_desc);
 
         let can_id = CanId {
             priority: msg_type.priority(),
@@ -199,92 +205,105 @@ where
             source_node_id,
             frame_type,
         };
-        trace!("can id:{:?}", can_id);
+        trace!("can id: {:?}", can_id);
 
         // The transfer payload is up to 7 bytes for non-FD DRONECAN.
         // If data is longer than a single frame, set up a multi-frame transfer.
         if payload.len() >= DATA_FRAME_MAX_LEN_LEGACY {
             trace!("multiple frames payload");
-            return self.queue_multiple_frames(
+            self.queue_multiple_frames(
+                txf_key,
                 payload,
                 can_id.value(),
                 transfer_id,
                 msg_type.base_crc(),
-            );
+            )
+        } else {
+            trace!("single frame payload");
+            // copy the data
+            txf_desc
+                .payload
+                .extend_from_slice(payload)
+                .map_err(|_| CanError::TxPayloadBufferFull)?;
+            let tail_byte = TailByte::new(TransferComponent::SingleFrame, transfer_id);
+            trace!("tail_byte:{:?}", tail_byte);
+            txf_desc
+                .payload
+                .push(tail_byte.value())
+                .map_err(|_| CanError::TxPayloadBufferFull)?;
+
+            let id =
+                embedded_can::Id::Extended(embedded_can::ExtendedId::new(can_id.value()).unwrap());
+            trace!("frame can id: {:?}", id);
+            self.tx_queue
+                .push_back(FRAME::new(id, txf_desc.payload.as_slice()).unwrap())
+                .map_err(|_| CanError::TransmitQueueFull)?;
+            // reset the tx buffer
+            txf_desc.payload.clear();
+            Ok(())
         }
-
-        // make a new buffer to construct the data for a single frame, we need to append one byte
-        // to the payload for the tail byte
-        txf_desc
-            .payload
-            .extend_from_slice(payload)
-            .map_err(|_| CanError::TxPayloadBufferFull)?;
-        let tail_byte = TailByte::new(TransferComponent::SingleFrame, transfer_id);
-        trace!("tail_byte:{:?}", tail_byte);
-        txf_desc
-            .payload
-            .push(tail_byte.value())
-            .map_err(|_| CanError::TxPayloadBufferFull)?;
-
-        let id = embedded_can::Id::Extended(embedded_can::ExtendedId::new(can_id.value()).unwrap());
-        self.tx_queue
-            .push_back(FRAME::new(id, txf_desc.payload.as_slice()).unwrap())
-            .map_err(|_| CanError::TransmitQueueFull)?;
-        Ok(())
     }
 
     /// Handles splitting a payload into multiple frames
     /// when it is larger than a single frame
     fn queue_multiple_frames(
         &mut self,
+        txf_key: TransferDescKey,
         payload: &[u8],
         can_id: u32,
         transfer_id: u8,
         base_crc: u16,
     ) -> Result<(), CanError> {
-        let frame_payload_len = DATA_FRAME_MAX_LEN_LEGACY;
-
+        debug!("queue multiple frames");
         let id = embedded_can::Id::Extended(embedded_can::ExtendedId::new(can_id).unwrap());
+        trace!("canid:{:?}", id);
+
+        let txf_desc = match self.txf_map.get_mut(&txf_key) {
+            Some(t) => Ok(t),
+            None => panic!(),
+        }?;
 
         let mut crc = TransferCrc::new(base_crc);
         crc.add_payload(payload, payload.len());
-
-        // We use slices of the FD buf, even for legacy frames, to keep code simple.
-        let bufs = unsafe { &mut MULTI_FRAME_BUFS_TX };
-
+        trace!("payload crc:{:?}", crc);
         // See https://dronecan.github.io/Specification/4._CAN_bus_transport_layer/,
         // "Multi-frame transfer" re requirements such as CRC and Toggle bit.
         let mut component = TransferComponent::MultiStart;
-        let mut active_frame = 0;
-        // This tracks the index of the payload we sent in the previous frame.
 
         // Populate the first frame. This is different from the others due to the CRC.
-        let mut tail_byte = TailByte::new(component, transfer_id);
         let mut payload_len_this_frame = DATA_FRAME_MAX_LEN_LEGACY - 3; // -3 for CRC and tail byte.
 
-        // Add 2 for the CRC.
-        let tail_byte_i = find_tail_byte_index(payload_len_this_frame as u8 + 2);
+        txf_desc
+            .payload
+            .extend_from_slice(&crc.value.to_le_bytes())
+            .map_err(|_| CanError::TxPayloadBufferFull)?;
+        txf_desc
+            .payload
+            .extend_from_slice(&payload[..payload_len_this_frame])
+            .map_err(|_| CanError::TxPayloadBufferFull)?;
+        let tail_byte = TailByte::new(component, transfer_id);
+        trace!("tail_byte:{:?}", tail_byte);
+        txf_desc
+            .payload
+            .push(tail_byte.value())
+            .map_err(|_| CanError::TxPayloadBufferFull)?;
 
-        bufs[active_frame][..2].clone_from_slice(&crc.value.to_le_bytes());
-        bufs[active_frame][2..DATA_FRAME_MAX_LEN_LEGACY - 1]
-            .clone_from_slice(&payload[..payload_len_this_frame]);
-        bufs[active_frame][tail_byte_i] = tail_byte.value();
-
-        let f = FRAME::new(id, &bufs[active_frame][..payload_len_this_frame]).unwrap();
+        let f = FRAME::new(id, &txf_desc.payload).unwrap();
+        trace!("frame queued");
         self.tx_queue
             .push_back(f)
             .map_err(|_| CanError::TransmitQueueFull)?;
 
         let mut latest_i_sent = payload_len_this_frame - 1;
 
-        active_frame += 1;
-
         // Populate subsequent frames.
         while latest_i_sent < payload.len() - 1 {
+            trace!("latest_i_sent:{}", latest_i_sent);
+            txf_desc.payload.clear();
             let payload_i = latest_i_sent + 1;
-            if payload_i + frame_payload_len <= payload.len() {
+            if payload_i + DATA_FRAME_MAX_LEN_LEGACY <= payload.len() {
                 // Not the last frame.
-                payload_len_this_frame = frame_payload_len - 1;
+                payload_len_this_frame = DATA_FRAME_MAX_LEN_LEGACY - 1;
                 component = TransferComponent::MultiMid(tail_byte.toggle);
             } else {
                 // Last frame.
@@ -292,22 +311,28 @@ where
                 component = TransferComponent::MultiEnd(tail_byte.toggle);
             }
 
-            tail_byte = TailByte::new(component, transfer_id);
+            txf_desc
+                .payload
+                .extend_from_slice(&payload[payload_i..payload_i + payload_len_this_frame])
+                .map_err(|_| CanError::TxPayloadBufferFull)?;
 
-            bufs[active_frame][0..payload_len_this_frame]
-                .clone_from_slice(&payload[payload_i..payload_i + payload_len_this_frame]);
+            let tail_byte = TailByte::new(component, transfer_id);
+            trace!("tail_byte:{:?}", tail_byte);
+            txf_desc
+                .payload
+                .push(tail_byte.value())
+                .map_err(|_| CanError::TxPayloadBufferFull)?;
 
-            let tail_byte_i = find_tail_byte_index(payload_len_this_frame as u8);
-            bufs[active_frame][tail_byte_i] = tail_byte.value();
-
-            let f = FRAME::new(id, &bufs[active_frame][..payload_len_this_frame]).unwrap();
+            let f = FRAME::new(id, &txf_desc.payload).unwrap();
+            trace!("next frame queued");
             self.tx_queue
                 .push_back(f)
                 .map_err(|_| CanError::TransmitQueueFull)?;
 
             latest_i_sent += payload_len_this_frame; // 8 byte frame size, - 1 for each frame's tail byte.
-            active_frame += 1;
         }
+        // clear buffer
+        txf_desc.payload.clear();
 
         Ok(())
     }
@@ -321,11 +346,12 @@ where
         iface_index: usize,
         frame: FRAME,
         frame_ts: u64,
-    ) -> Result<Option<&TransferDesc>, CanError> {
+        f: impl Fn(&RxPayload),
+    ) -> Result<(), CanError> {
         // get the CanId
         let can_id = match frame.id() {
             embedded_can::Id::Extended(eid) => CanId::from_value(eid.as_raw()),
-            _ => return Ok(None),
+            _ => return Ok(()),
         };
         debug!(
             "handle_frame_rx: Frame Id: {:?} dlc:{}",
@@ -367,7 +393,8 @@ where
                 < TransferDesc::TRANSFER_ID_HALF_RANGE;
         let not_previous_tid =
             TransferDesc::compute_forward_distance(tail_byte.transfer_id, txf_desc.transfer_id) > 1;
-        trace!("tid_timed_out:{} iface_switch_allowed:{} same_iface:{} non_wrapped_tid:{} not_previous_tid:{}", tid_timed_out, iface_switch_allowed, same_iface, non_wrapped_tid, not_previous_tid);
+        trace!("initialized:{} tid_timed_out:{} iface_switch_allowed:{} same_iface:{} non_wrapped_tid:{} not_previous_tid:{}",
+               self.initialized, tid_timed_out, iface_switch_allowed, same_iface, non_wrapped_tid, not_previous_tid);
 
         // check the state flags, deciding whether to restart
         if !self.initialized
@@ -384,25 +411,25 @@ where
             txf_desc.next_toggle_bit = false;
             // ignore this frame, if start of transfer was missed
             if !tail_byte.start_of_transfer {
-                txf_desc.transfer_id += 1;
-                return Ok(None);
+                txf_desc.transfer_id_then_incr();
+                return Ok(());
             }
         }
 
         if iface_index != txf_desc.iface_index {
             trace!("wrong interface");
             // wrong interface, ignore
-            return Ok(None);
+            return Ok(());
         }
         if tail_byte.toggle != txf_desc.next_toggle_bit {
             trace!("unexpected toggle bit");
             // unexpected toggle bit, ignore
-            return Ok(None);
+            return Ok(());
         }
         if tail_byte.transfer_id != txf_desc.transfer_id {
             trace!("unexpected transfer id");
             // unexpected transfer ID, ignore
-            return Ok(None);
+            return Ok(());
         }
         if tail_byte.start_of_transfer {
             txf_desc.ts = frame_ts;
@@ -410,21 +437,44 @@ where
 
         // update the toggle bit
         txf_desc.next_toggle_bit = !txf_desc.next_toggle_bit;
-        // copy the frame data to the buffer
+        // copy the frame data to the buffer, minus the tail byte
         txf_desc
             .payload
-            .extend_from_slice(frame.data())
+            .extend_from_slice(&frame.data()[0..frame.dlc() - 1])
             .map_err(|_| CanError::RxPayloadBufferFull)?;
         trace!("descriptor final state: {:?}", txf_desc);
 
         if tail_byte.end_of_transfer {
             // do something with the payload
-            txf_desc.transfer_id += 1;
+            let rx_completed = if tail_byte.start_of_transfer {
+                // single frame payload
+                RxPayload {
+                    id: can_id,
+                    transfer_id: txf_desc.transfer_id,
+                    ts: txf_desc.ts,
+                    payload_crc: None,
+                    payload: txf_desc.payload.as_slice(),
+                }
+            } else {
+                // multi-frame payload
+                let bits = txf_desc.payload.as_slice().view_bits::<Msb0>();
+                let payload_crc = Some(bits[0..16].load_le());
+                RxPayload {
+                    id: can_id,
+                    transfer_id: txf_desc.transfer_id,
+                    ts: txf_desc.ts,
+                    payload_crc,
+                    payload: &txf_desc.payload.as_slice()[2..],
+                }
+            };
+            f(&rx_completed);
+
+            // setup for the next one
+            txf_desc.transfer_id_then_incr();
             txf_desc.next_toggle_bit = false;
-            Ok(Some(txf_desc))
-        } else {
-            Ok(None)
+            txf_desc.payload.clear();
         }
+        Ok(())
     }
 }
 
@@ -524,7 +574,7 @@ mod test {
     }
 
     #[test]
-    fn test_default() {
+    fn test_txfr_desc_default() {
         let txfr = TransferDesc::default();
         assert_eq!(0, txfr.transfer_id);
         assert_eq!(false, txfr.next_toggle_bit);
@@ -534,7 +584,7 @@ mod test {
     }
 
     #[test]
-    fn test_compute_forward_distance() {
+    fn test_txfr_desc_compute_forward_distance() {
         assert_eq!(0, TransferDesc::compute_forward_distance(0, 0));
         assert_eq!(1, TransferDesc::compute_forward_distance(0, 1));
         assert_eq!(7, TransferDesc::compute_forward_distance(0, 7));
@@ -556,12 +606,12 @@ mod test {
             ),
         ])
         .unwrap();
-        let rx_exp = Vec::new();
-        let intf = MockCan::new(expected_tx, rx_exp);
+        let expected_rx = Vec::new();
+        let intf = MockCan::new(expected_tx, expected_rx);
         let mut uav = Uavcan::new(2000, 300);
         uav.add_interface(intf);
 
-        // now send 2 frames
+        // now send 2 frames each a message of 7 bytes
         let frame_type = FrameType::Message;
         let msg_type = MsgType::NodeStatus;
         let source_node_id = 1;
@@ -572,4 +622,143 @@ mod test {
             .unwrap();
         uav.can_send().unwrap();
     }
+
+    #[test]
+    fn test_broadcast2() {
+        let expected_tx = Vec::from_slice(&[
+            MockFrame::new(
+                ExtendedId::new(0x6015501).unwrap(),
+                &[0x9e, 0x33, 0x01, 0x02, 0x03, 0x04, 0x05, 0x80],
+            ),
+            MockFrame::new(
+                ExtendedId::new(0x6015501).unwrap(),
+                &[0x06, 0x07, 0x8, 0x60],
+            ),
+            MockFrame::new(
+                ExtendedId::new(0x6015501).unwrap(),
+                &[0x9e, 0x33, 0x01, 0x02, 0x03, 0x04, 0x05, 0x81],
+            ),
+            MockFrame::new(
+                ExtendedId::new(0x6015501).unwrap(),
+                &[0x06, 0x07, 0x8, 0x61],
+            ),
+        ])
+        .unwrap();
+        let expected_rx = Vec::new();
+        let intf = MockCan::new(expected_tx, expected_rx);
+        let mut uav = Uavcan::new(2000, 300);
+        uav.add_interface(intf);
+
+        // now send 4 frames, consisting of 2 messages of 8 bytes
+        let frame_type = FrameType::Message;
+        let msg_type = MsgType::NodeStatus;
+        let source_node_id = 1;
+        let payload = [0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8];
+        uav.broadcast(frame_type, msg_type, source_node_id, &payload)
+            .unwrap();
+        uav.broadcast(frame_type, msg_type, source_node_id, &payload)
+            .unwrap();
+        uav.can_send().unwrap();
+    }
+
+    #[test]
+    fn test_rx1() {
+        let expected_rx = Vec::from_slice(&[
+            MockFrame::new(
+                ExtendedId::new(0x6015501).unwrap(),
+                &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0xc0],
+            ),
+            MockFrame::new(
+                ExtendedId::new(0x6015501).unwrap(),
+                &[0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0xc1],
+            ),
+            MockFrame::new(
+                ExtendedId::new(0x6015501).unwrap(),
+                &[0x9e, 0x33, 0x01, 0x02, 0x03, 0x04, 0x05, 0x82],
+            ),
+            MockFrame::new(
+                ExtendedId::new(0x6015501).unwrap(),
+                &[0x06, 0x07, 0x8, 0x62],
+            ),
+            MockFrame::new(
+                ExtendedId::new(0x6015501).unwrap(),
+                &[0x9e, 0x33, 0x01, 0x02, 0x03, 0x04, 0x05, 0x83],
+            ),
+            MockFrame::new(
+                ExtendedId::new(0x6015501).unwrap(),
+                &[0x06, 0x07, 0x8, 0x63],
+            ),
+        ])
+        .unwrap();
+        let expected_tx = Vec::new();
+        let intf = MockCan::new(expected_tx, expected_rx);
+        let mut uav = Uavcan::new(2000, 300);
+        uav.add_interface(intf);
+
+        // now get 4 frames, first is (2) 7 byte messages, followed by (2) messages of 8 bytes
+        let frame = uav.iface[0].receive().unwrap();
+        let _ = uav.handle_frame_rx(0, frame, 10, |rx| {
+            assert_eq!(rx.id, CanId::from_value(0x6015501));
+            assert_eq!(rx.transfer_id, 0);
+            assert_eq!(rx.ts, 10);
+            assert!(rx.payload_crc.is_none());
+            assert_eq!(rx.payload, [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
+        });
+        let frame = uav.iface[0].receive().unwrap();
+        let _ = uav.handle_frame_rx(0, frame, 20, |rx| {
+            assert_eq!(rx.id, CanId::from_value(0x6015501));
+            assert_eq!(rx.transfer_id, 1);
+            assert_eq!(rx.ts, 20);
+            assert!(rx.payload_crc.is_none());
+            assert_eq!(rx.payload, [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
+        });
+
+        // the multi frame messages now
+        let frame = uav.iface[0].receive().unwrap();
+        let _ = uav.handle_frame_rx(0, frame, 40, |_rx| {
+            assert!(false);
+        });
+        let frame = uav.iface[0].receive().unwrap();
+        let _ = uav.handle_frame_rx(0, frame, 45, |rx| {
+            assert_eq!(rx.id, CanId::from_value(0x6015501));
+            assert_eq!(rx.transfer_id, 2);
+            assert_eq!(rx.ts, 40);
+            assert_eq!(13214, rx.payload_crc.unwrap());
+            assert_eq!(rx.payload, [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        });
+        let frame = uav.iface[0].receive().unwrap();
+        let _ = uav.handle_frame_rx(0, frame, 50, |_rx| {
+            assert!(false);
+        });
+        let frame = uav.iface[0].receive().unwrap();
+        let _ = uav.handle_frame_rx(0, frame, 55, |rx| {
+            assert_eq!(rx.id, CanId::from_value(0x6015501));
+            assert_eq!(rx.transfer_id, 3);
+            assert_eq!(rx.ts, 50);
+            assert_eq!(13214, rx.payload_crc.unwrap());
+            assert_eq!(rx.payload, [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        });
+    }
+
+    // #[derive(Debug)]
+    // struct FooBar {
+    //     foo: i32,
+    //     bar: i32,
+    // }
+    // impl FooBar {
+    //     fn woot(&mut self, x: i32) {
+    //         self.foo += x;
+    //         self.bar -= x
+    //     }
+    // }
+
+    // fn call(foobar: &mut FooBar, functor: fn(&mut FooBar, x: i32), v: i32) {
+    //     functor(foobar, v)
+    // }
+
+    // fn main() {
+    //     let mut foobar = FooBar { foo: 123, bar: 123 };
+    //     call(&mut foobar, FooBar::woot, 234);
+    //     println!("{:?}", foobar);
+    // }
 }

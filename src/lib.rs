@@ -37,6 +37,7 @@ pub fn bit_size_to_byte_size(len_bits: usize) -> usize {
     }
 }
 
+/// Errors that can occur in dronecan
 #[cfg_attr(feature = "defmt", derive(Format))]
 #[derive(Debug, Clone, Copy)]
 pub enum CanError {

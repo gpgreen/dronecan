@@ -207,50 +207,6 @@ impl TailByte {
             transfer_id,
         }
     }
-
-    pub fn get_tail_byte(payload: &[u8], frame_len: u8) -> Result<TailByte, CanError> {
-        let i = find_tail_byte_index(frame_len);
-
-        if i > payload.len() {
-            return Err(CanError::PayloadSize);
-        }
-
-        Ok(TailByte::from_value(payload[i]))
-    }
-}
-
-/// Determine the index for placing the tail byte of the payload. This procedure doesn't appear to
-/// be defined in the docs, but is defined in official software implementations.
-///
-/// Const fn for use in creating statically-sized buffers.
-/// It appears this is only valid for FD; the answer is always 7 on classic CAN.
-pub const fn find_tail_byte_index(payload_len: u8) -> usize {
-    // We take this comparatively verbose approach vice the loop below to be compatible
-    // with const fns.
-
-    if payload_len < 8 {
-        return payload_len as usize;
-    }
-    if payload_len < 12 {
-        return 11;
-    }
-    if payload_len < 16 {
-        return 15;
-    }
-    if payload_len < 20 {
-        return 19;
-    }
-    if payload_len < 24 {
-        return 23;
-    }
-    if payload_len < 32 {
-        return 31;
-    }
-    if payload_len < 48 {
-        return 47;
-    }
-
-    63
 }
 
 #[cfg_attr(feature = "defmt", derive(Format))]

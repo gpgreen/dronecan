@@ -7,7 +7,7 @@ use crate::{
     },
     f16,
     gnss::{FixDronecan, GlobalNavSolution, GnssAuxiliary},
-    interface::Uavcan,
+    interface::UavcanInterface,
     messages::MsgType,
     protocol::{FrameType, RequestResponse, ServiceData},
     CanError,
@@ -52,7 +52,7 @@ static mut BUF_POWER_SUPPLY_STATUS: [u8; 8] = [0; 8];
 /// Must be broadcast at intervals between 2 and 1000ms. FC firmware should
 /// consider the node to be faulty if this is not received for 3s.
 pub fn publish_node_status<CAN, FRAME>(
-    can: &mut Uavcan<CAN, FRAME>,
+    can: &mut UavcanInterface<CAN, FRAME>,
     health: NodeHealth,
     mode: NodeMode,
     vendor_specific_status_code: u16,
@@ -78,7 +78,7 @@ where
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/1.GetNodeInfo.uavcan
 /// A composite type sent in response to a request.
 pub fn publish_node_info<CAN, FRAME>(
-    can: &mut Uavcan<CAN, FRAME>,
+    can: &mut UavcanInterface<CAN, FRAME>,
     node_info: &GetNodeInfoResponse,
     node_id: u8,
     requester_node_id: u8,
@@ -102,7 +102,7 @@ where
 /// This is published in response to a requested.
 /// todo: What is the data type ID? 4 is in conflict.
 pub fn publish_transport_stats<CAN, FRAME>(
-    can: &mut Uavcan<CAN, FRAME>,
+    can: &mut UavcanInterface<CAN, FRAME>,
     num_transmitted: u64,
     num_received: u64,
     num_errors: u64,
@@ -128,7 +128,7 @@ where
 /// with any reason text from any sender published with the interval no higher than MAX_INTERVAL_MS before
 /// undertaking any emergency actions." (Min messages: 3. Max interval: 500ms)
 pub fn publish_panic<CAN, FRAME>(
-    can: &mut Uavcan<CAN, FRAME>,
+    can: &mut UavcanInterface<CAN, FRAME>,
     reason_text: &mut [u8],
     node_id: u8,
 ) -> Result<(), CanError>
@@ -147,7 +147,7 @@ where
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/4.GlobalTimeSync.uavcan
 pub fn publish_time_sync<CAN, FRAME>(
-    can: &mut Uavcan<CAN, FRAME>,
+    can: &mut UavcanInterface<CAN, FRAME>,
     previous_transmission_timestamp_usec: u64,
     node_id: u8,
 ) -> Result<(), CanError>
@@ -170,7 +170,7 @@ where
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/air_data/1028.StaticPressure.uavcan
 pub fn publish_static_pressure<CAN, FRAME>(
-    can: &mut Uavcan<CAN, FRAME>,
+    can: &mut UavcanInterface<CAN, FRAME>,
     pressure: f32,          // Pascal
     pressure_variance: f32, // Pascal^2. 16-bit
     node_id: u8,
@@ -193,7 +193,7 @@ where
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/air_data/1029.StaticTemperature.uavcan
 pub fn publish_temperature<CAN, FRAME>(
-    can: &mut Uavcan<CAN, FRAME>,
+    can: &mut UavcanInterface<CAN, FRAME>,
     temperature: f32,          // Kelvin. 16-bit.
     temperature_variance: f32, // Kelvin^2. 16-bit
     node_id: u8,
@@ -217,7 +217,7 @@ where
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/ahrs/1000.Solution.uavcan
 pub fn publish_ahrs_solution<CAN, FRAME>(
-    can: &mut Uavcan<CAN, FRAME>,
+    can: &mut UavcanInterface<CAN, FRAME>,
     solution: AhrsSolution,
     node_id: u8,
 ) -> Result<(), CanError>
@@ -237,7 +237,7 @@ where
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/ahrs/1002.MagneticFieldStrength2.uavcan
 pub fn publish_mag_field_strength<CAN, FRAME>(
-    can: &mut Uavcan<CAN, FRAME>,
+    can: &mut UavcanInterface<CAN, FRAME>,
     sensor_id: u8,
     magnetic_field: &[f32; 3],          // f16. Gauss; X, Y, Z.
     _magnetic_field_covariance: &[f32], // f16
@@ -267,7 +267,7 @@ where
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/ahrs/1003.RawIMU.uavcan
 pub fn publish_raw_imu<CAN, FRAME>(
-    can: &mut Uavcan<CAN, FRAME>,
+    can: &mut UavcanInterface<CAN, FRAME>,
     timestamp: u64,  // 7-bytes, us.
     gyro: [f32; 3],  // f16. x, y, z. rad/s (Roll, pitch, yaw)
     accel: [f32; 3], // f16. x, y, z. m/s^2
@@ -303,7 +303,7 @@ where
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/navigation/2000.GlobalNavigationSolution.uavcan
 pub fn publish_global_navigation_solution<CAN, FRAME>(
-    can: &mut Uavcan<CAN, FRAME>,
+    can: &mut UavcanInterface<CAN, FRAME>,
     data: &GlobalNavSolution,
     // todo: Covariances?
     node_id: u8,
@@ -323,7 +323,7 @@ where
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/gnss/1061.Auxiliary.uavcan
 pub fn publish_gnss_aux<CAN, FRAME>(
-    can: &mut Uavcan<CAN, FRAME>,
+    can: &mut UavcanInterface<CAN, FRAME>,
     data: &GnssAuxiliary,
     // todo: Covariances?
     node_id: u8,
@@ -343,7 +343,7 @@ where
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/gnss/1063.Fix2.uavcan
 pub fn publish_fix2<CAN, FRAME>(
-    can: &mut Uavcan<CAN, FRAME>,
+    can: &mut UavcanInterface<CAN, FRAME>,
     data: &FixDronecan,
     // todo: Covariances?
     node_id: u8,
@@ -366,7 +366,7 @@ where
 /// Must be broadcast at intervals between 2 and 1000ms. FC firmware should
 /// consider the node to be faulty if this is not received for 3s.
 pub fn publish_ardupilot_gnss_status<CAN, FRAME>(
-    can: &mut Uavcan<CAN, FRAME>,
+    can: &mut UavcanInterface<CAN, FRAME>,
     error_codes: u32,
     _healthy: bool,
     _status: u32,
@@ -395,7 +395,7 @@ where
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/dynamic_node_id/1.Allocation.uavcan
 /// Send while the node is anonymous; requests an ID.
 pub fn request_id_allocation_req<CAN, FRAME>(
-    can: &mut Uavcan<CAN, FRAME>,
+    can: &mut UavcanInterface<CAN, FRAME>,
     data: &IdAllocationData,
     node_id: u8,
 ) -> Result<(), CanError>
@@ -418,7 +418,7 @@ where
 /// we have, we reply with an empty response. This indicates that we have passed all parameters.
 /// The requester increments the index starting at 0 to poll parameters available.
 pub fn publish_getset_resp<CAN, FRAME>(
-    can: &mut Uavcan<CAN, FRAME>,
+    can: &mut UavcanInterface<CAN, FRAME>,
     _data: &GetSetResponse,
     node_id: u8,
     requester_node_id: u8,
@@ -444,7 +444,7 @@ where
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/4.GlobalTimeSync.uavcan
 pub fn _handle_time_sync<CAN, FRAME>(
-    _can: &mut Uavcan<CAN, FRAME>,
+    _can: &mut UavcanInterface<CAN, FRAME>,
     payload: &[u8],
     _node_id: u8,
 ) -> Result<(), CanError>
@@ -463,7 +463,7 @@ where
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/5.RestartNode.uavcan
 pub fn handle_restart_request<CAN, FRAME>(
-    can: &mut Uavcan<CAN, FRAME>,
+    can: &mut UavcanInterface<CAN, FRAME>,
     payload: &[u8],
     node_id: u8,
     requester_node_id: u8,
@@ -577,7 +577,7 @@ impl ActuatorCommand {
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/actuator/Command.uavcan
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/actuator/1010.ArrayCommand.uavcan
 pub fn publish_actuator_commands<CAN, FRAME>(
-    can: &mut Uavcan<CAN, FRAME>,
+    can: &mut UavcanInterface<CAN, FRAME>,
     commands: &[ActuatorCommand],
     node_id: u8,
 ) -> Result<(), CanError>
@@ -613,7 +613,7 @@ where
 
 /// [DSDL 1091](https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/power/1091.CircuitStatus.uavcan)
 pub fn publish_circuit_status<CAN, FRAME>(
-    can: &mut Uavcan<CAN, FRAME>,
+    can: &mut UavcanInterface<CAN, FRAME>,
     circuit_id: u16,
     voltage: f32,
     current: f32,
@@ -645,7 +645,7 @@ where
 
 /// [DSDL 1090](https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/power/1090.PrimaryPowerSupplyStatus.uavcan)
 pub fn publish_power_supply_status<CAN, FRAME>(
-    can: &mut Uavcan<CAN, FRAME>,
+    can: &mut UavcanInterface<CAN, FRAME>,
     hours_to_empty: f32,
     hours_to_empty_variance: f32,
     external_power_avail: bool,

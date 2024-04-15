@@ -84,6 +84,7 @@ impl From<u8> for NodeMode {
     }
 }
 
+/// Size of Payload for NodeStatus message (fixed)
 pub const PAYLOAD_SIZE_NODE_STATUS: usize = 7;
 
 /// Broadcast periodically, and sent as part of the Node Status message.
@@ -125,12 +126,12 @@ impl NodeStatus {
     }
 }
 
+/// Maximum Size of Payload for HardwareVersion, (variable)
 pub const HARDWARE_VERSION_MAX_SIZE: usize = 19 + 255;
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/HardwareVersion.uavcan
 /// Generic hardware version information.
 /// These values should remain unchanged for the device's lifetime.
-// pub struct HardwareVersion<'a> {
 #[cfg_attr(feature = "defmt", derive(Format))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HardwareVersion {
@@ -139,6 +140,8 @@ pub struct HardwareVersion {
     /// Unique ID is a 128 bit long sequence that is globally unique for each node.
     /// All zeros is not a valid UID.
     /// If filled with zeros, assume that the value is undefined.
+    /// on linux we can get one via:
+    /// sudo cat /sys/class/dmi/id/product_uuid
     pub unique_id: [u8; 16],
     // We currently don't use certificate of authority.
     // /// Certificate of authenticity (COA) of the hardware, 255 bytes max.
@@ -194,6 +197,7 @@ impl HardwareVersion {
     }
 }
 
+/// Size of payload for SoftwareVersion (fixed)
 pub const PAYLOAD_SIZE_SOFTWARE_VERSION: usize = 15;
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/SoftwareVersion.uavcan
@@ -245,6 +249,7 @@ impl SoftwareVersion {
 /// Maximum size of the Vec for GetNodeInfoResponse
 pub const UAVCAN_PROTOCOL_GET_NODE_INFO_RESPONSE_MAX_SIZE: usize = 377;
 
+///
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/GetNodeInfoResponse.uavcan
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(Format))]
@@ -252,6 +257,11 @@ pub struct GetNodeInfoResponse {
     pub node_status: NodeStatus,
     pub sw_version: SoftwareVersion,
     pub hw_version: HardwareVersion,
+    /// Human readable non-empty ASCII node name.
+    /// Node name shall not be changed while the node is running.
+    /// Empty string is not a valid node name.
+    /// Allowed characters are: a-z (lowercase ASCII letters) 0-9 (decimal digits) . (dot) - (dash) _ (underscore).
+    /// Node name is a reversed internet domain name (like Java packages), e.g. "com.manufacturer.project.product".
     pub name: String<80>, // max length of 80
 }
 
@@ -275,7 +285,7 @@ impl GetNodeInfoResponse {
         let hw = self.hw_version.to_bytes();
         buf[start..start + hw.len()].clone_from_slice(&hw);
         start += hw.len();
-        if self.name.len() > 80 {
+        if self.name.is_empty() || self.name.len() > 80 {
             panic!();
         }
         buf[start] = self.name.len() as u8;
@@ -830,7 +840,7 @@ impl Default for Covariance {
     }
 }
 
-/// Maximum size of the Vec for AhrsSolution
+/// Maximum size of the Vec for AhrsSolution (variable)
 pub const UAVCAN_EQUIPMENT_AHRS_SOLUTION_MAX_SIZE: usize = 84;
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/ahrs/1000.Solution.uavcan

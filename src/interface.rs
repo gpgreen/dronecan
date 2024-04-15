@@ -8,7 +8,7 @@ use crate::{
 };
 use bitvec::prelude::*;
 use embedded_can;
-use heapless::{Deque, Entry, FnvIndexMap, Vec};
+use heapless::{Deque, FnvIndexMap, Vec};
 use log::*;
 
 pub(crate) const DATA_FRAME_MAX_LEN_LEGACY: usize = 8;
@@ -66,15 +66,15 @@ impl TransferDesc {
         }
     }
 
-    /// Get the current transfer_id
+    /// Get the transfer_id
     pub fn transfer_id(&mut self) -> u8 {
         self.transfer_id
     }
 
-    /// Get the current transfer_id, then increment it
+    /// Increment the transfer_id
     ///
     /// transfer_id's are 5 bits in length and roll over when
-    pub fn transfer_id_then_incr(&mut self) -> u8 {
+    pub fn transfer_id_incr(&mut self) -> u8 {
         let id = self.transfer_id;
         self.transfer_id += 1;
         self.transfer_id &= 0b1_1111;
@@ -85,7 +85,7 @@ impl TransferDesc {
 /// The `RxPayload` contains state for a completed transfer
 #[cfg_attr(feature = "defmt", derive(Format))]
 #[derive(Debug, Clone, PartialEq)]
-pub struct RxPayload<'a> {
+pub struct RxPayload {
     /// The `CanId` of the payload
     pub id: CanId,
     /// Transfer number for this payload
@@ -95,11 +95,11 @@ pub struct RxPayload<'a> {
     /// If a multi-frame payload, this is the crc
     pub payload_crc: Option<u16>,
     /// the payload in bytes
-    pub payload: &'a [u8],
+    pub payload: Vec<u8, RX_TX_BUFFER_MAX_SIZE>,
 }
 
 /// Broadcast struct for Uavcan on CAN interface
-pub struct Uavcan<CAN, FRAME> {
+pub struct UavcanInterface<CAN, FRAME> {
     iface: Vec<CAN, 2>,
     tx_queue: Deque<FRAME, 10>,
     txf_map: FnvIndexMap<TransferDescKey, TransferDesc, 16>, // size must be power of 2
@@ -108,12 +108,12 @@ pub struct Uavcan<CAN, FRAME> {
     interface_switch_delay: u64,
 }
 
-impl<CAN, FRAME, FE> Uavcan<CAN, FRAME>
+impl<CAN, FRAME, FE> UavcanInterface<CAN, FRAME>
 where
     CAN: embedded_can::blocking::Can<Frame = FRAME, Error = FE>,
     FRAME: embedded_can::Frame,
 {
-    /// Create new `Uavcan`
+    /// Create new `UavcanInterface`
     pub fn new(transfer_timeout: u64, interface_switch_delay: u64) -> Self {
         Self {
             iface: Vec::new(),
@@ -166,23 +166,18 @@ where
         }
 
         // get the transfer descriptor
-        // first construct the key from the info provided, then
-        // we can get the descriptor from the hashmap
         let txf_key = TransferDescKey::new(frame_type, msg_type.id(), source_node_id);
         trace!("txf_key:{:?}", txf_key);
-        loop {
-            match self.txf_map.entry(txf_key) {
-                Entry::Occupied(_v) => break,
-                Entry::Vacant(v) => {
-                    let desc = TransferDesc::default();
-                    v.insert(desc).map_err(|_| CanError::TransferMapFull)?;
-                }
-            }
+        if !self.txf_map.contains_key(&txf_key) {
+            self.txf_map
+                .insert(txf_key, TransferDesc::default())
+                .map_err(|_| CanError::TransferMapFull)?;
         }
         let txf_desc = match self.txf_map.get_mut(&txf_key) {
             Some(t) => Ok(t),
             None => panic!(),
         }?;
+        // TODO: update descriptor with timestamp
         trace!("descriptor start state:{:?}", txf_desc);
 
         // if this is a service reply, use the existing transfer id, otherwise, increment and
@@ -192,10 +187,10 @@ where
                 if s.req_or_resp == RequestResponse::Response {
                     txf_desc.transfer_id()
                 } else {
-                    txf_desc.transfer_id_then_incr()
+                    txf_desc.transfer_id_incr()
                 }
             }
-            _ => txf_desc.transfer_id_then_incr(),
+            _ => txf_desc.transfer_id_incr(),
         };
         trace!("descriptor updated state:{:?}", txf_desc);
 
@@ -346,7 +341,7 @@ where
         iface_index: usize,
         frame: FRAME,
         frame_ts: u64,
-        f: impl Fn(&RxPayload),
+        f: impl FnOnce() -> RxPayload,
     ) -> Result<(), CanError> {
         // get the CanId
         let can_id = match frame.id() {
@@ -369,14 +364,10 @@ where
         let txf_key =
             TransferDescKey::new(can_id.frame_type, can_id.type_id, can_id.source_node_id);
         trace!("txf_key: {:?}", txf_key);
-        loop {
-            match self.txf_map.entry(txf_key) {
-                Entry::Occupied(_v) => break,
-                Entry::Vacant(v) => {
-                    let desc = TransferDesc::default();
-                    v.insert(desc).map_err(|_| CanError::TransferMapFull)?;
-                }
-            }
+        if !self.txf_map.contains_key(&txf_key) {
+            self.txf_map
+                .insert(txf_key, TransferDesc::default())
+                .map_err(|_| CanError::TransferMapFull)?;
         }
         let txf_desc = match self.txf_map.get_mut(&txf_key) {
             Some(t) => Ok(t),
@@ -402,7 +393,7 @@ where
             || (same_iface && tail_byte.start_of_transfer && not_previous_tid)
             || (iface_switch_allowed && tail_byte.start_of_transfer && non_wrapped_tid)
         {
-            debug!("needs a restart");
+            debug!("needs a restart from txfid:{}", txf_desc.transfer_id);
             // needs a restart
             self.initialized = true;
             txf_desc.iface_index = iface_index;
@@ -411,7 +402,7 @@ where
             txf_desc.next_toggle_bit = false;
             // ignore this frame, if start of transfer was missed
             if !tail_byte.start_of_transfer {
-                txf_desc.transfer_id_then_incr();
+                txf_desc.transfer_id_incr();
                 return Ok(());
             }
         }
@@ -433,6 +424,7 @@ where
         }
         if tail_byte.start_of_transfer {
             txf_desc.ts = frame_ts;
+            txf_desc.iface_index = iface_index;
         }
 
         // update the toggle bit
@@ -446,31 +438,35 @@ where
 
         if tail_byte.end_of_transfer {
             // do something with the payload
+            let mut pv = Vec::new();
             let rx_completed = if tail_byte.start_of_transfer {
+                pv.extend_from_slice(txf_desc.payload.as_slice()).unwrap();
                 // single frame payload
                 RxPayload {
                     id: can_id,
                     transfer_id: txf_desc.transfer_id,
                     ts: txf_desc.ts,
                     payload_crc: None,
-                    payload: txf_desc.payload.as_slice(),
+                    payload: pv,
                 }
             } else {
                 // multi-frame payload
                 let bits = txf_desc.payload.as_slice().view_bits::<Msb0>();
                 let payload_crc = Some(bits[0..16].load_le());
+                pv.extend_from_slice(&txf_desc.payload.as_slice()[2..])
+                    .unwrap();
                 RxPayload {
                     id: can_id,
                     transfer_id: txf_desc.transfer_id,
                     ts: txf_desc.ts,
                     payload_crc,
-                    payload: &txf_desc.payload.as_slice()[2..],
+                    payload: pv,
                 }
             };
-            f(&rx_completed);
+            f(|_| rx_completed);
 
             // setup for the next one
-            txf_desc.transfer_id_then_incr();
+            txf_desc.transfer_id_incr();
             txf_desc.next_toggle_bit = false;
             txf_desc.payload.clear();
         }
@@ -608,7 +604,7 @@ mod test {
         .unwrap();
         let expected_rx = Vec::new();
         let intf = MockCan::new(expected_tx, expected_rx);
-        let mut uav = Uavcan::new(2000, 300);
+        let mut uav = UavcanInterface::new(2000, 300);
         uav.add_interface(intf);
 
         // now send 2 frames each a message of 7 bytes
@@ -646,7 +642,7 @@ mod test {
         .unwrap();
         let expected_rx = Vec::new();
         let intf = MockCan::new(expected_tx, expected_rx);
-        let mut uav = Uavcan::new(2000, 300);
+        let mut uav = UavcanInterface::new(2000, 300);
         uav.add_interface(intf);
 
         // now send 4 frames, consisting of 2 messages of 8 bytes
@@ -692,7 +688,7 @@ mod test {
         .unwrap();
         let expected_tx = Vec::new();
         let intf = MockCan::new(expected_tx, expected_rx);
-        let mut uav = Uavcan::new(2000, 300);
+        let mut uav = UavcanInterface::new(2000, 300);
         uav.add_interface(intf);
 
         // now get 4 frames, first is (2) 7 byte messages, followed by (2) messages of 8 bytes

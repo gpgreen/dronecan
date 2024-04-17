@@ -227,7 +227,7 @@ pub enum RequestResponse {
 /// - Priority (5 bits)
 /// - Message type ID: Data type ID of the encoded message (16 bits)
 /// - Service not message: Always 0. 1 bit.
-/// - Source nod ID.Can be 1-27. 7 bits.
+/// - Source node ID.Can be 1-27. 7 bits.
 #[cfg_attr(feature = "defmt", derive(Format))]
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct CanId {

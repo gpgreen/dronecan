@@ -86,8 +86,6 @@ impl TransferDesc {
 #[cfg_attr(feature = "defmt", derive(Format))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct RxPayload {
-    /// The `CanId` of the payload
-    pub id: CanId,
     /// Transfer number for this payload
     pub transfer_id: u8,
     /// timestamp at beginning of payload
@@ -95,12 +93,12 @@ pub struct RxPayload {
     /// If a multi-frame payload, this is the crc
     pub payload_crc: Option<u16>,
     /// the payload in bytes
-    pub payload: Vec<u8, RX_TX_BUFFER_MAX_SIZE>,
+    pub payload: &'static Vec<u8, RX_TX_BUFFER_MAX_SIZE>,
 }
 
 /// Broadcast struct for Uavcan on CAN interface
 pub struct UavcanInterface<CAN, FRAME> {
-    iface: Vec<CAN, 2>,
+    pub iface: Vec<CAN, 2>,
     tx_queue: Deque<FRAME, 10>,
     txf_map: FnvIndexMap<TransferDescKey, TransferDesc, 16>, // size must be power of 2
     initialized: bool,
@@ -335,24 +333,22 @@ where
     /// Handle a new received frame. This returns the TransferDesc with the assembled payload
     /// if this is the last frame in a multi-frame transfer, or if it's a single-frame transfer.
     /// Returns None if frame is ignored for state reasons, or in the middle of a multi-frame payload
+    ///
+    /// SAFETY: unsafe due to use of static buffer reference in `RxPayload`. If the static buffer is not
+    /// read and copied before this method is called again, the contents of this receive transfer
+    /// will be lost.
+    ///
     /// see algorithm at [The DroneCAN spec, transport layer page](https://dronecan.github.io/Specification/4._CAN_bus_transport_layer/)
-    pub fn handle_frame_rx(
+    pub unsafe fn handle_frame_rx(
         &mut self,
         iface_index: usize,
-        frame: FRAME,
+        can_id: &CanId,
+        frame: &FRAME,
         frame_ts: u64,
-        f: impl FnOnce() -> RxPayload,
-    ) -> Result<(), CanError> {
-        // get the CanId
-        let can_id = match frame.id() {
-            embedded_can::Id::Extended(eid) => CanId::from_value(eid.as_raw()),
-            _ => return Ok(()),
-        };
-        debug!(
-            "handle_frame_rx: Frame Id: {:?} dlc:{}",
-            can_id,
-            frame.dlc()
-        );
+        //        f: impl FnOnce() -> RxPayload,
+    ) -> Result<Option<RxPayload>, CanError> {
+        // static buffer to use in RxPayload
+        static mut PAYLOAD_BUFFER: Vec<u8, RX_TX_BUFFER_MAX_SIZE> = Vec::new();
 
         // get the tail byte
         let tail_byte = TailByte::from_value(frame.data()[frame.dlc() - 1]);
@@ -403,24 +399,24 @@ where
             // ignore this frame, if start of transfer was missed
             if !tail_byte.start_of_transfer {
                 txf_desc.transfer_id_incr();
-                return Ok(());
+                return Ok(None);
             }
         }
 
         if iface_index != txf_desc.iface_index {
             trace!("wrong interface");
             // wrong interface, ignore
-            return Ok(());
+            return Ok(None);
         }
         if tail_byte.toggle != txf_desc.next_toggle_bit {
             trace!("unexpected toggle bit");
             // unexpected toggle bit, ignore
-            return Ok(());
+            return Ok(None);
         }
         if tail_byte.transfer_id != txf_desc.transfer_id {
             trace!("unexpected transfer id");
             // unexpected transfer ID, ignore
-            return Ok(());
+            return Ok(None);
         }
         if tail_byte.start_of_transfer {
             txf_desc.ts = frame_ts;
@@ -438,39 +434,41 @@ where
 
         if tail_byte.end_of_transfer {
             // do something with the payload
-            let mut pv = Vec::new();
+            PAYLOAD_BUFFER.clear();
             let rx_completed = if tail_byte.start_of_transfer {
-                pv.extend_from_slice(txf_desc.payload.as_slice()).unwrap();
+                PAYLOAD_BUFFER
+                    .extend_from_slice(txf_desc.payload.as_slice())
+                    .unwrap();
                 // single frame payload
                 RxPayload {
-                    id: can_id,
                     transfer_id: txf_desc.transfer_id,
                     ts: txf_desc.ts,
                     payload_crc: None,
-                    payload: pv,
+                    payload: &PAYLOAD_BUFFER,
                 }
             } else {
                 // multi-frame payload
                 let bits = txf_desc.payload.as_slice().view_bits::<Msb0>();
                 let payload_crc = Some(bits[0..16].load_le());
-                pv.extend_from_slice(&txf_desc.payload.as_slice()[2..])
+                // copy the payload, minus the CRC bytes
+                PAYLOAD_BUFFER
+                    .extend_from_slice(&txf_desc.payload.as_slice()[2..])
                     .unwrap();
                 RxPayload {
-                    id: can_id,
                     transfer_id: txf_desc.transfer_id,
                     ts: txf_desc.ts,
                     payload_crc,
-                    payload: pv,
+                    payload: &PAYLOAD_BUFFER,
                 }
             };
-            f(|_| rx_completed);
 
             // setup for the next one
             txf_desc.transfer_id_incr();
             txf_desc.next_toggle_bit = false;
             txf_desc.payload.clear();
+            return Ok(Some(rx_completed));
         }
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -693,47 +691,94 @@ mod test {
 
         // now get 4 frames, first is (2) 7 byte messages, followed by (2) messages of 8 bytes
         let frame = uav.iface[0].receive().unwrap();
-        let _ = uav.handle_frame_rx(0, frame, 10, |rx| {
-            assert_eq!(rx.id, CanId::from_value(0x6015501));
+        let can_id = match frame.id() {
+            embedded_can::Id::Extended(eid) => Some(CanId::from_value(eid.as_raw())),
+            _ => None,
+        }
+        .unwrap();
+        let rx_res = unsafe { uav.handle_frame_rx(0, &can_id, &frame, 10) };
+        if let Ok(Some(rx)) = rx_res {
             assert_eq!(rx.transfer_id, 0);
             assert_eq!(rx.ts, 10);
             assert!(rx.payload_crc.is_none());
-            assert_eq!(rx.payload, [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
-        });
+            assert_eq!(rx.payload, &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
+        } else {
+            assert!(false);
+        }
         let frame = uav.iface[0].receive().unwrap();
-        let _ = uav.handle_frame_rx(0, frame, 20, |rx| {
-            assert_eq!(rx.id, CanId::from_value(0x6015501));
+        let can_id = match frame.id() {
+            embedded_can::Id::Extended(eid) => Some(CanId::from_value(eid.as_raw())),
+            _ => None,
+        }
+        .unwrap();
+        let rx_res = unsafe { uav.handle_frame_rx(0, &can_id, &frame, 20) };
+        if let Ok(Some(rx)) = rx_res {
             assert_eq!(rx.transfer_id, 1);
             assert_eq!(rx.ts, 20);
             assert!(rx.payload_crc.is_none());
-            assert_eq!(rx.payload, [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
-        });
+            assert_eq!(rx.payload, &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
+        } else {
+            assert!(false);
+        }
 
         // the multi frame messages now
         let frame = uav.iface[0].receive().unwrap();
-        let _ = uav.handle_frame_rx(0, frame, 40, |_rx| {
+        let can_id = match frame.id() {
+            embedded_can::Id::Extended(eid) => Some(CanId::from_value(eid.as_raw())),
+            _ => None,
+        }
+        .unwrap();
+        let rx_res = unsafe { uav.handle_frame_rx(0, &can_id, &frame, 40) };
+        if let Ok(Some(_rx)) = rx_res {
             assert!(false);
-        });
+        };
         let frame = uav.iface[0].receive().unwrap();
-        let _ = uav.handle_frame_rx(0, frame, 45, |rx| {
-            assert_eq!(rx.id, CanId::from_value(0x6015501));
+        let can_id = match frame.id() {
+            embedded_can::Id::Extended(eid) => Some(CanId::from_value(eid.as_raw())),
+            _ => None,
+        }
+        .unwrap();
+        let rx_res = unsafe { uav.handle_frame_rx(0, &can_id, &frame, 45) };
+        if let Ok(Some(rx)) = rx_res {
             assert_eq!(rx.transfer_id, 2);
             assert_eq!(rx.ts, 40);
             assert_eq!(13214, rx.payload_crc.unwrap());
-            assert_eq!(rx.payload, [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
-        });
-        let frame = uav.iface[0].receive().unwrap();
-        let _ = uav.handle_frame_rx(0, frame, 50, |_rx| {
+            assert_eq!(
+                rx.payload,
+                &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+            );
+        } else {
             assert!(false);
-        });
+        }
+
         let frame = uav.iface[0].receive().unwrap();
-        let _ = uav.handle_frame_rx(0, frame, 55, |rx| {
-            assert_eq!(rx.id, CanId::from_value(0x6015501));
+        let can_id = match frame.id() {
+            embedded_can::Id::Extended(eid) => Some(CanId::from_value(eid.as_raw())),
+            _ => None,
+        }
+        .unwrap();
+        let rx_res = unsafe { uav.handle_frame_rx(0, &can_id, &frame, 50) };
+        if let Ok(Some(_rx)) = rx_res {
+            assert!(false);
+        };
+        let frame = uav.iface[0].receive().unwrap();
+        let can_id = match frame.id() {
+            embedded_can::Id::Extended(eid) => Some(CanId::from_value(eid.as_raw())),
+            _ => None,
+        }
+        .unwrap();
+        let rx_res = unsafe { uav.handle_frame_rx(0, &can_id, &frame, 55) };
+        if let Ok(Some(rx)) = rx_res {
             assert_eq!(rx.transfer_id, 3);
             assert_eq!(rx.ts, 50);
             assert_eq!(13214, rx.payload_crc.unwrap());
-            assert_eq!(rx.payload, [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
-        });
+            assert_eq!(
+                rx.payload,
+                &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+            );
+        } else {
+            assert!(false);
+        }
     }
 
     // #[derive(Debug)]

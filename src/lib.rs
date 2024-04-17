@@ -8,7 +8,6 @@
 use core::mem;
 
 pub mod broadcast;
-
 mod crc;
 pub mod dsdl;
 pub mod gnss;
@@ -16,8 +15,6 @@ pub mod interface;
 pub mod messages;
 pub mod protocol;
 
-pub use broadcast::*;
-pub use dsdl::*;
 pub use interface::*;
 pub use messages::*;
 pub use protocol::*;
@@ -39,16 +36,21 @@ pub fn bit_size_to_byte_size(len_bits: usize) -> usize {
 
 /// Errors that can occur in dronecan
 #[cfg_attr(feature = "defmt", derive(Format))]
-#[derive(Debug, Clone, Copy)]
-pub enum CanError {
-    Hardware,
+#[derive(Debug, Clone)]
+pub enum CanError<E: embedded_can::Error + core::fmt::Debug> {
+    Hardware(E),
     PayloadSize,
-    FrameSize,
     PayloadData,
     TransmitQueueFull,
     TransferMapFull,
     RxPayloadBufferFull,
     TxPayloadBufferFull,
+}
+
+impl<E: embedded_can::Error> From<E> for CanError<E> {
+    fn from(e: E) -> CanError<E> {
+        CanError::Hardware(e)
+    }
 }
 
 /// 16-bit floating point

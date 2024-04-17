@@ -5,7 +5,7 @@
 #[cfg(feature = "defmt")]
 use defmt::*;
 
-use crate::{MsgPriority, PAYLOAD_SIZE_CONFIG_COMMON, PAYLOAD_SIZE_NODE_STATUS};
+use crate::{dsdl::PAYLOAD_SIZE_NODE_STATUS, MsgPriority, PAYLOAD_SIZE_CONFIG_COMMON};
 
 pub struct ParseError {}
 

@@ -1,4 +1,4 @@
-use crate::{CanError, PAYLOAD_SIZE_CONFIG_COMMON};
+use crate::PAYLOAD_SIZE_CONFIG_COMMON;
 
 // Per DC spec.
 pub const NODE_ID_MIN_VALUE: u8 = 1;

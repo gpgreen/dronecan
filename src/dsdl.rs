@@ -478,10 +478,10 @@ impl<'a> Value<'a> {
     /// Converts from a bit array, eg one of a larger message. Anchors using bit indexes
     /// passed as arguments.
     /// Returns self, and current bit index.
-    pub fn from_bits(
+    pub fn from_bits<E: embedded_can::Error>(
         bits: &BitSlice<u8, Msb0>,
         tag_start_i: usize,
-    ) -> Result<(Self, usize), CanError> {
+    ) -> Result<(Self, usize), CanError<E>> {
         let val_start_i = tag_start_i + VALUE_TAG_BIT_LEN;
 
         Ok(match bits[tag_start_i..val_start_i].load_le::<u8>() {
@@ -540,7 +540,10 @@ impl<'a> GetSetRequest<'a> {
     //     }
     // }
 
-    pub fn from_bytes(buf: &[u8], fd_mode: bool) -> Result<Self, CanError> {
+    pub fn from_bytes<E: embedded_can::Error>(
+        buf: &[u8],
+        fd_mode: bool,
+    ) -> Result<Self, CanError<E>> {
         let bits = buf.view_bits::<Msb0>();
 
         let tag_start_i = 13;
@@ -635,7 +638,7 @@ impl<'a> GetSetResponse<'a> {
         crate::bit_size_to_byte_size(i_bit)
     }
 
-    pub fn from_bytes(buf: &[u8]) -> Result<Self, CanError> {
+    pub fn from_bytes<E: embedded_can::Error>(buf: &[u8]) -> Result<Self, CanError<E>> {
         let _bits = buf.view_bits::<Msb0>();
 
         unimplemented!() // todo: You just need to work thorugh it like with related.

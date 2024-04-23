@@ -7,7 +7,6 @@
 
 use core::mem;
 
-pub mod broadcast;
 mod crc;
 pub mod dsdl;
 pub mod gnss;

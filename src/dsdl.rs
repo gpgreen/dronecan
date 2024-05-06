@@ -3,10 +3,11 @@
 use crate::{f16, protocol::ConfigCommon, CanError, MsgType};
 use bitvec::prelude::*;
 use heapless::{String, Vec};
-//use log::*;
 
 #[cfg(feature = "defmt")]
 use defmt::*;
+#[cfg(not(feature = "defmt"))]
+use log::*;
 
 // pub const PARAM_NAME_NODE_ID: [u8; 14] = *b"uavcan.node_id";
 // pub const PARAM_NAME_NODE_ID: &'static [u8] = "uavcan.node_id".as_bytes();
@@ -1025,26 +1026,28 @@ impl AhrsSolution {
         }
         bit_index += 3 * 16;
 
-        // covariance
-        let (_head, rest) = bits.split_at(bit_index);
-        let mut itr = rest.chunks(4);
-        // skip pad
-        itr.next();
-        let len = itr.next().unwrap().load_le();
-        bit_index += 8;
+        // covariance (can be missing if tail-array optimization)
         let mut linear_acceleration_covariance = Covariance { data: Vec::new() };
-        if len != 0 {
+        debug!("bit_index: {} buf_len: {}", bit_index, buf.len());
+        if buf.len() > bit_index / 8 {
             let (_head, rest) = bits.split_at(bit_index);
-            for (i, slot) in rest.chunks(16).enumerate() {
-                if i == len {
-                    break;
+            let mut itr = rest.chunks(4);
+            // skip pad
+            itr.next();
+            let len = itr.next().unwrap().load_le();
+            bit_index += 8;
+            if len != 0 {
+                let (_head, rest) = bits.split_at(bit_index);
+                for (i, slot) in rest.chunks(16).enumerate() {
+                    if i == len {
+                        break;
+                    }
+                    let v: u16 = slot.load_le();
+                    let sf = f16 { bits: v };
+                    linear_acceleration_covariance.data.push(sf.to_f32()).ok();
                 }
-                let v: u16 = slot.load_le();
-                let sf = f16 { bits: v };
-                linear_acceleration_covariance.data.push(sf.to_f32()).ok();
             }
         }
-
         Self {
             uavcan_timestamp,
             orientation_xyzw,

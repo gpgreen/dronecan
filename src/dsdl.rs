@@ -924,23 +924,28 @@ impl AhrsSolution {
             i + 16
         });
 
-        // 4-bit pad and len covar
-        bits[bit_index..bit_index + 4].store_le(0);
-        let bit_index = bit_index + 4;
-        bits[bit_index..bit_index + 4].store_le(self.linear_acceleration_covariance.data.len());
-        let bit_index = bit_index + 4;
-        let bit_index = self
-            .linear_acceleration_covariance
-            .data
-            .iter()
-            .fold(bit_index, |i, x| {
-                let v = u16::from_le_bytes(f16::from_f32(*x).to_le_bytes());
-                bits[i..i + 16].store_le(v);
-                i + 16
-            });
+        // tail array optimization, leave off if empty
+        if !self.linear_acceleration_covariance.data.is_empty() {
+            // 4-bit pad and len covar
+            bits[bit_index..bit_index + 4].store_le(0);
+            let bit_index = bit_index + 4;
+            bits[bit_index..bit_index + 4].store_le(self.linear_acceleration_covariance.data.len());
+            let bit_index = bit_index + 4;
+            let bit_index =
+                self.linear_acceleration_covariance
+                    .data
+                    .iter()
+                    .fold(bit_index, |i, x| {
+                        let v = u16::from_le_bytes(f16::from_f32(*x).to_le_bytes());
+                        bits[i..i + 16].store_le(v);
+                        i + 16
+                    });
 
-        // resize buf back to actual length
-        buf.truncate(bit_index / 8);
+            // resize buf back to actual length
+            buf.truncate(bit_index / 8);
+        } else {
+            buf.truncate(bit_index / 8);
+        }
         buf
     }
 
@@ -1060,6 +1065,113 @@ impl AhrsSolution {
     }
 }
 
+/// Maximum size of the Vec for MagneticFieldStrength2
+pub const UAVCAN_EQUIPMENT_AHRS_MAGNETIC_FIELD_STRENGTH2_MAX_SIZE: usize = 26;
+
+///
+/// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/ahrs/MagneticFieldStrength2.uavcan
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+pub struct MagneticFieldStrength2 {
+    pub sensor_id: u8,
+    pub magnetic_field_ga: [f32; 3],
+    pub magnetic_field_covariance: Covariance,
+}
+
+impl MagneticFieldStrength2 {
+    /// serialize `MagneticFieldStrength2` to buffer
+    pub fn to_bytes(&self) -> Vec<u8, UAVCAN_EQUIPMENT_AHRS_MAGNETIC_FIELD_STRENGTH2_MAX_SIZE> {
+        let mut buf = Vec::new();
+        buf.resize_default(UAVCAN_EQUIPMENT_AHRS_MAGNETIC_FIELD_STRENGTH2_MAX_SIZE)
+            .unwrap();
+        // copy sensor id
+        buf[0] = self.sensor_id;
+
+        let bits = buf.view_bits_mut::<Msb0>();
+
+        let bit_index = 8; // starting at 8 bits, for rest of message
+
+        let bit_index = self.magnetic_field_ga.iter().fold(bit_index, |i, x| {
+            let v = u16::from_le_bytes(f16::from_f32(*x).to_le_bytes());
+            bits[i..i + 16].store_le(v);
+            i + 16
+        });
+
+        // tail array optimization, if not there, don't output anything
+        if !self.magnetic_field_covariance.data.is_empty() {
+            // 4-bit pad and len covar
+            bits[bit_index..bit_index + 4].store_le(0);
+            let bit_index = bit_index + 4;
+            bits[bit_index..bit_index + 4].store_le(self.magnetic_field_covariance.data.len());
+            let bit_index = bit_index + 4;
+            let bit_index = self
+                .magnetic_field_covariance
+                .data
+                .iter()
+                .fold(bit_index, |i, x| {
+                    let v = u16::from_le_bytes(f16::from_f32(*x).to_le_bytes());
+                    bits[i..i + 16].store_le(v);
+                    i + 16
+                });
+            // resize buf back to actual length
+            buf.truncate(bit_index / 8);
+        } else {
+            // resize buf back to actual length
+            buf.truncate(bit_index / 8);
+        }
+
+        buf
+    }
+
+    /// construct `MagneticFieldStrength2` from buffer
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        // sensor id is 1 byte
+        let sensor_id = buf[0];
+
+        let bits = buf.view_bits::<Msb0>();
+
+        let mut bit_index = 8;
+
+        // load field
+        let mut magnetic_field_ga = [0_f32; 3];
+        let (_head, rest) = bits.split_at(bit_index);
+        for (slot, f) in rest.chunks(16).zip(magnetic_field_ga.iter_mut()) {
+            let v: u16 = slot.load_le();
+            let sf = f16 { bits: v };
+            *f = sf.to_f32();
+        }
+        bit_index += 3 * 16;
+
+        // covariance (can be missing if tail-array optimization)
+        let mut magnetic_field_covariance = Covariance { data: Vec::new() };
+        debug!("bit_index: {} buf_len: {}", bit_index, buf.len());
+        if buf.len() > bit_index / 8 {
+            let (_head, rest) = bits.split_at(bit_index);
+            let mut itr = rest.chunks(4);
+            // skip pad
+            itr.next();
+            let len = itr.next().unwrap().load_le();
+            bit_index += 8;
+            if len != 0 {
+                let (_head, rest) = bits.split_at(bit_index);
+                for (i, slot) in rest.chunks(16).enumerate() {
+                    if i == len {
+                        break;
+                    }
+                    let v: u16 = slot.load_le();
+                    let sf = f16 { bits: v };
+                    magnetic_field_covariance.data.push(sf.to_f32()).ok();
+                }
+            }
+        }
+        Self {
+            sensor_id,
+            magnetic_field_ga,
+            magnetic_field_covariance,
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -1149,39 +1261,18 @@ mod test {
     }
 
     #[test]
-    fn test_get_node_info_response() {
-        let name = String::try_from("test_get_node_info_response").unwrap();
-        let nmlen = name.len();
-        let sol1 = GetNodeInfoResponse {
-            node_status: NodeStatus {
-                uptime_sec: 1,
-                health: NodeHealth::Warning,
-                mode: NodeMode::Offline,
-                vendor_specific_status_code: 22344,
-            },
-            sw_version: SoftwareVersion {
-                major: 1,
-                minor: 1,
-                optional_field_flags: 0x3,
-                vcs_commit: 2344,
-                image_crc: u64::MAX,
-            },
-            hw_version: HardwareVersion {
-                major: 2,
-                minor: 2,
-                unique_id: [
-                    0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf, 0x10,
-                ],
-                certificate_of_authority: None,
-            },
-            name,
+    fn test_magnetic_field_strength2() {
+        let field = MagneticFieldStrength2 {
+            sensor_id: 22,
+            magnetic_field_ga: [0.0, 1.0, 2.0],
+            magnetic_field_covariance: Covariance { data: Vec::new() },
         };
-        let gnir_buf = sol1.to_bytes();
+        let field_buf = field.to_bytes();
         assert_eq!(
-            gnir_buf.len(),
-            UAVCAN_PROTOCOL_GET_NODE_INFO_RESPONSE_MAX_SIZE - 80 + nmlen - 255
+            field_buf.len(),
+            UAVCAN_EQUIPMENT_AHRS_MAGNETIC_FIELD_STRENGTH2_MAX_SIZE - 19
         );
-        let sol2 = GetNodeInfoResponse::from_bytes(gnir_buf.as_slice());
-        assert_eq!(sol2, sol1);
+        let field2 = MagneticFieldStrength2::from_bytes(field_buf.as_slice());
+        assert_eq!(field2, field);
     }
 }

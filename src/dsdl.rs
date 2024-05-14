@@ -6,8 +6,8 @@ use heapless::{String, Vec};
 
 #[cfg(feature = "defmt")]
 use defmt::*;
-#[cfg(not(feature = "defmt"))]
-use log::*;
+//#[cfg(not(feature = "defmt"))]
+//use log::*;
 
 // pub const PARAM_NAME_NODE_ID: [u8; 14] = *b"uavcan.node_id";
 // pub const PARAM_NAME_NODE_ID: &'static [u8] = "uavcan.node_id".as_bytes();
@@ -1033,7 +1033,6 @@ impl AhrsSolution {
 
         // covariance (can be missing if tail-array optimization)
         let mut linear_acceleration_covariance = Covariance { data: Vec::new() };
-        debug!("bit_index: {} buf_len: {}", bit_index, buf.len());
         if buf.len() > bit_index / 8 {
             let (_head, rest) = bits.split_at(bit_index);
             let mut itr = rest.chunks(4);
@@ -1144,7 +1143,6 @@ impl MagneticFieldStrength2 {
 
         // covariance (can be missing if tail-array optimization)
         let mut magnetic_field_covariance = Covariance { data: Vec::new() };
-        debug!("bit_index: {} buf_len: {}", bit_index, buf.len());
         if buf.len() > bit_index / 8 {
             let (_head, rest) = bits.split_at(bit_index);
             let mut itr = rest.chunks(4);
@@ -1172,6 +1170,154 @@ impl MagneticFieldStrength2 {
     }
 }
 
+/// Maximum size of the Vec for Rgb565
+pub const UAVCAN_EQUIPMENT_INDICATION_RGB565_MAX_SIZE: usize = 2;
+
+/// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/indication/RGB565.uavcan
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+pub struct Rgb565 {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+}
+
+impl Rgb565 {
+    /// serialize `Rgb565` to buffer
+    pub fn to_bytes(&self) -> [u8; 2] {
+        let mut buf = [0_u8; 2];
+        let green = self.green & 0x3f;
+        buf[0] = (self.red & 0x1f) << 3 | (green & 0x38) >> 3;
+        buf[1] = (green & 0x7) << 5 | (self.blue & 0x1f);
+        buf
+    }
+
+    /// extract `Rgb565` from buffer
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        Self {
+            red: (buf[0] & 0xf8) >> 3,
+            green: ((buf[0] & 0x7) << 3) | (buf[1] >> 5),
+            blue: (buf[1] & 0x1f),
+        }
+    }
+}
+
+/// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/indication/SingleLightCommand.uavcan
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[repr(u8)]
+pub enum LightId {
+    Other(u8),
+    AntiCollision = 246,
+    RightOfWay = 247,
+    Strobe = 248,
+    Wing = 249,
+    Logo = 250,
+    Taxi = 251,
+    TurnOff = 252,
+    TakeOff = 253,
+    Landing = 254,
+    Formation = 255,
+}
+
+impl From<u8> for LightId {
+    fn from(val: u8) -> Self {
+        match val {
+            246 => LightId::AntiCollision,
+            247 => LightId::RightOfWay,
+            248 => LightId::Strobe,
+            249 => LightId::Wing,
+            250 => LightId::Logo,
+            251 => LightId::Taxi,
+            252 => LightId::TurnOff,
+            253 => LightId::TakeOff,
+            254 => LightId::Landing,
+            255 => LightId::Formation,
+            0..=245 => LightId::Other(val),
+        }
+    }
+}
+
+impl From<LightId> for u8 {
+    fn from(val: LightId) -> u8 {
+        match val {
+            LightId::AntiCollision => 246,
+            LightId::RightOfWay => 247,
+            LightId::Strobe => 248,
+            LightId::Wing => 249,
+            LightId::Logo => 250,
+            LightId::Taxi => 251,
+            LightId::TurnOff => 252,
+            LightId::TakeOff => 253,
+            LightId::Landing => 254,
+            LightId::Formation => 255,
+            LightId::Other(n) => n,
+        }
+    }
+}
+
+/// Maximum size of the Vec for SingleLightCommand
+pub const UAVCAN_EQUIPMENT_INDICATION_SINGLELIGHTCOMMAND_SIZE: usize = 3;
+
+/// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/indication/SingleLightCommand.uavcan
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+pub struct SingleLightCommand {
+    pub light_id: LightId,
+    pub color: Rgb565,
+}
+
+impl SingleLightCommand {
+    /// serialize `SingleLightCommand` to buffer
+    pub fn to_bytes(&self) -> [u8; UAVCAN_EQUIPMENT_INDICATION_SINGLELIGHTCOMMAND_SIZE] {
+        let mut buf = [0_u8; UAVCAN_EQUIPMENT_INDICATION_SINGLELIGHTCOMMAND_SIZE];
+        buf[0] = self.light_id.clone().into();
+        buf[1..].clone_from_slice(&self.color.to_bytes());
+        buf
+    }
+
+    /// extract `SingleLightCommand` from buffer
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        Self {
+            light_id: buf[0].into(),
+            color: Rgb565::from_bytes(&buf[1..UAVCAN_EQUIPMENT_INDICATION_SINGLELIGHTCOMMAND_SIZE]),
+        }
+    }
+}
+
+/// Maximum size of the Vec for LightsCommand
+pub const UAVCAN_EQUIPMENT_INDICATION_LIGHTSCOMMAND_MAX_SIZE: usize =
+    UAVCAN_EQUIPMENT_INDICATION_SINGLELIGHTCOMMAND_SIZE * 20;
+
+///
+/// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/indication/LightsCommand.uavcan
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+pub struct LightsCommand {
+    pub data: Vec<SingleLightCommand, 20>,
+}
+
+impl LightsCommand {
+    /// serialize `LightsCommand` to buffer
+    pub fn to_bytes(&self) -> Vec<u8, UAVCAN_EQUIPMENT_INDICATION_LIGHTSCOMMAND_MAX_SIZE> {
+        let mut buf = Vec::new();
+        for cmd in self.data.iter() {
+            buf.extend_from_slice(&cmd.to_bytes()).ok();
+        }
+        buf
+    }
+
+    /// construct `LightsCommand` from buffer
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        let mut data = Vec::new();
+        for buf in buf.chunks(UAVCAN_EQUIPMENT_INDICATION_SINGLELIGHTCOMMAND_SIZE) {
+            let cmd = SingleLightCommand::from_bytes(buf);
+            data.push(cmd).ok();
+        }
+        Self { data }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -1189,7 +1335,7 @@ mod test {
             linear_acceleration_covariance: Covariance::default(),
         };
         let sol1_buf = sol1.to_bytes();
-        assert_eq!(sol1_buf.len(), 30);
+        assert_eq!(sol1_buf.len(), 29);
         let sol2 = AhrsSolution::from_bytes(sol1_buf.as_slice());
         assert_eq!(sol2, sol1);
     }
@@ -1274,5 +1420,54 @@ mod test {
         );
         let field2 = MagneticFieldStrength2::from_bytes(field_buf.as_slice());
         assert_eq!(field2, field);
+    }
+
+    #[test]
+    fn test_rgb565() {
+        let col1 = Rgb565 {
+            red: 0x15,
+            green: 0x2a,
+            blue: 0x15,
+        };
+        let buf = col1.to_bytes();
+        assert_eq!(buf, [0xad, 0x55]);
+        let col1back = Rgb565::from_bytes(&buf);
+        assert_eq!(col1, col1back);
+    }
+
+    #[test]
+    fn test_singlelightcommand() {
+        let cmd1 = SingleLightCommand {
+            light_id: LightId::Wing,
+            color: Rgb565 {
+                red: 0x15,
+                green: 0x2a,
+                blue: 0x15,
+            },
+        };
+        let buf = cmd1.to_bytes();
+        assert_eq!(buf, [249, 0xad, 0x55]);
+        let cmd1back = SingleLightCommand::from_bytes(&buf);
+        assert_eq!(cmd1, cmd1back);
+    }
+
+    #[test]
+    fn test_lightscommand() {
+        let mut cmd1 = LightsCommand { data: Vec::new() };
+        let lc1 = SingleLightCommand {
+            light_id: LightId::Wing,
+            color: Rgb565 {
+                red: 0x15,
+                green: 0x2a,
+                blue: 0x15,
+            },
+        };
+        cmd1.data.push(lc1.clone()).unwrap();
+        let buf = cmd1.to_bytes();
+        assert_eq!(buf.len(), 3);
+        assert_eq!(buf[0..3], [249, 0xad, 0x55]);
+        let cmd1back = LightsCommand::from_bytes(&buf);
+        assert_eq!(cmd1, cmd1back);
+        assert_eq!(cmd1.data[0], lc1);
     }
 }

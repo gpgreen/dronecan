@@ -5,10 +5,16 @@
 #[cfg(feature = "defmt")]
 use defmt::*;
 
-use crate::{dsdl::PAYLOAD_SIZE_NODE_STATUS, MsgPriority, PAYLOAD_SIZE_CONFIG_COMMON};
+use crate::{
+    dsdl::PAYLOAD_SIZE_NODE_STATUS, dsdl::UAVCAN_EQUIPMENT_AHRS_MAGNETIC_FIELD_STRENGTH2_MAX_SIZE,
+    dsdl::UAVCAN_EQUIPMENT_AHRS_SOLUTION_MAX_SIZE,
+    dsdl::UAVCAN_EQUIPMENT_INDICATION_LIGHTSCOMMAND_MAX_SIZE, MsgPriority,
+    PAYLOAD_SIZE_CONFIG_COMMON,
+};
 
 pub struct ParseError {}
 
+/// Dronecan Message Type
 #[cfg_attr(feature = "defmt", derive(Format))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MsgType {
@@ -48,6 +54,7 @@ pub enum MsgType {
     PositFusedAnyleaf,
     Telemetry,
     PowerStats,
+    LightsCommand,
     CircuitStatus,
     PowerSupplyStatus,
 }
@@ -73,6 +80,7 @@ impl MsgType {
             Self::StaticTemperature => 1_029,
             Self::GnssAux => 1_061,
             Self::Fix2 => 1_063,
+            Self::LightsCommand => 1_081,
             Self::GlobalNavigationSolution => 2_000,
             Self::ActuatorArrayCommand => 1_010,
             Self::RcInput => 1_140,
@@ -114,6 +122,7 @@ impl MsgType {
             1_029 => Self::StaticTemperature,
             1_061 => Self::GnssAux,
             1_063 => Self::Fix2,
+            1_081 => Self::LightsCommand,
             2_000 => Self::GlobalNavigationSolution,
             1_010 => Self::ActuatorArrayCommand,
             1_140 => Self::RcInput,
@@ -157,6 +166,7 @@ impl MsgType {
     }
 
     /// Get the payload size. Does not include padding for a tail byte.
+    /// TODO: remove this
     pub const fn payload_size(&self) -> u8 {
         match self {
             Self::IdAllocation => 19, // Includes 16 bytes of unique id. (Needs a len field for FD mode)
@@ -173,14 +183,17 @@ impl MsgType {
             // AHRS solution: Assumes no covariance values. The first 2 cov fields have a 4-bit
             // length; the last doesn't use one for non-FD mode. So, for FD mode, you may need a custom len.
             // Includes the void fields.
-            Self::AhrsSolution => 29,
-            Self::MagneticFieldStrength2 => 7,
+            Self::AhrsSolution => UAVCAN_EQUIPMENT_AHRS_SOLUTION_MAX_SIZE as u8,
+            Self::MagneticFieldStrength2 => {
+                UAVCAN_EQUIPMENT_AHRS_MAGNETIC_FIELD_STRENGTH2_MAX_SIZE as u8
+            }
             Self::RawImu => 47,
             Self::RawAirData => 0,
             Self::StaticPressure => 6,
             Self::StaticTemperature => 4,
             Self::GnssAux => 16,
             Self::Fix2 => 62, // 50 without covariance, plus 12 with.
+            Self::LightsCommand => UAVCAN_EQUIPMENT_INDICATION_LIGHTSCOMMAND_MAX_SIZE as u8,
             // This assumes we are not using either dynamic-len fields `pose_covariance` or `velocity_covariance`.
             Self::GlobalNavigationSolution => 88,
             Self::ActuatorArrayCommand => 0, // Size is determined by the number of commands.
@@ -237,6 +250,7 @@ impl MsgType {
             Self::ArdupilotGnssStatus => 47_609,
             Self::CircuitStatus => 11_447,
             Self::PowerSupplyStatus => 22_815,
+            Self::LightsCommand => 40_497,
             _ => 0, // ie custom commands.
         }
     }

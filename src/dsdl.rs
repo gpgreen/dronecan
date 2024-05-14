@@ -9,10 +9,6 @@ use defmt::*;
 //#[cfg(not(feature = "defmt"))]
 //use log::*;
 
-// pub const PARAM_NAME_NODE_ID: [u8; 14] = *b"uavcan.node_id";
-// pub const PARAM_NAME_NODE_ID: &'static [u8] = "uavcan.node_id".as_bytes();
-// pub const PARAM_NAME_BIT_RATE: &'static [u8] = "uavcan.bit_rate".as_bytes();
-
 // To simplify some logic re trailing values, we only match the first few characters of the param name.
 pub const NAME_CUTOFF: usize = 6;
 
@@ -25,17 +21,7 @@ pub const PARAM_NAME_BITRATE: &[u8] = "CAN bitrate (see datasheet)".as_bytes();
 // or inhibit GPS.
 pub const PARAM_NAME_GPS_TYPE: &[u8] = "GPS_TYPE".as_bytes();
 
-// Used to determine which enum (union) variant is used.
-// "Tag is 3 bit long, so outer structure has 5-bit prefix to ensure proper alignment"
-const VALUE_TAG_BIT_LEN: usize = 3;
-const VALUE_NUMERIC_TAG_BIT_LEN: usize = 2;
-// For use in `GetSet`
-const NAME_LEN_BIT_SIZE: usize = 7; // round_up(log2(92+1));
-
-const MAX_GET_SET_NAME_LEN: usize = 50; // not overal max; max we use to keep buf size down
-
-// Size in bits of the value string's size byte (leading byte)
-const VALUE_STRING_LEN_SIZE: usize = 8; // round_up(log2(128+1));
+////////////////////////////////////////////////////////////////////////////////
 
 /// Reference: https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/341.NodeStatus.uavcan
 #[cfg_attr(feature = "defmt", derive(Format))]
@@ -59,6 +45,8 @@ impl From<u8> for NodeHealth {
         }
     }
 }
+
+////////////////////////////////////////////////////////////////////////////////
 
 /// Reference: https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/341.NodeStatus.uavcan
 #[cfg_attr(feature = "defmt", derive(Format))]
@@ -84,6 +72,8 @@ impl From<u8> for NodeMode {
         }
     }
 }
+
+////////////////////////////////////////////////////////////////////////////////
 
 /// Size of Payload for NodeStatus message (fixed)
 pub const PAYLOAD_SIZE_NODE_STATUS: usize = 7;
@@ -126,6 +116,8 @@ impl NodeStatus {
         }
     }
 }
+
+////////////////////////////////////////////////////////////////////////////////
 
 /// Maximum Size of Payload for HardwareVersion, (variable)
 pub const HARDWARE_VERSION_MAX_SIZE: usize = 19 + 255;
@@ -198,6 +190,8 @@ impl HardwareVersion {
     }
 }
 
+////////////////////////////////////////////////////////////////////////////////
+
 /// Size of payload for SoftwareVersion (fixed)
 pub const PAYLOAD_SIZE_SOFTWARE_VERSION: usize = 15;
 
@@ -246,6 +240,8 @@ impl SoftwareVersion {
         }
     }
 }
+
+////////////////////////////////////////////////////////////////////////////////
 
 /// Maximum size of the Vec for GetNodeInfoResponse
 pub const UAVCAN_PROTOCOL_GET_NODE_INFO_RESPONSE_MAX_SIZE: usize = 377;
@@ -320,9 +316,15 @@ impl GetNodeInfoResponse {
     }
 }
 
+////////////////////////////////////////////////////////////////////////////////
+
+/// Maximum size of the Vec for GetNodeInfoResponse
+pub const UAVCAN_PROTOCOL_EXECUTEOPCODE_REQUEST_SIZE: usize = 7;
+pub const UAVCAN_PROTOCOL_EXECUTEOPCODE_RESPONSE_SIZE: usize = 7;
+
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/param/10.ExecuteOpcode.uavcan
 #[cfg_attr(feature = "defmt", derive(Format))]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum OpcodeType {
     Save = 0,
@@ -331,13 +333,28 @@ pub enum OpcodeType {
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/param/10.ExecuteOpcode.uavcan
 /// Pertains to saving or erasing config to/from flash
-pub struct ExecuteOpcode {
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecuteOpcodeRequest {
     pub opcode: OpcodeType,
-    pub error_code: Option<i64>, // 48 bits.
-    pub ok: bool,
+    pub argument: i64,
 }
 
-impl ExecuteOpcode {
+impl ExecuteOpcodeRequest {
+    /// serialize `ExecuteOpcodeRequest` to buffer
+    pub fn to_bytes(&self) -> Vec<u8, UAVCAN_PROTOCOL_EXECUTEOPCODE_REQUEST_SIZE> {
+        let mut buf = Vec::new();
+        buf.push(match self.opcode {
+            OpcodeType::Save => 0,
+            OpcodeType::Erase => 1,
+        })
+        .ok();
+        buf.extend_from_slice(&self.argument.to_le_bytes()[..6])
+            .unwrap();
+        buf
+    }
+
+    /// construct `ExecuteOpcodeRequest` from buffer
     pub fn from_bytes(buf: &[u8]) -> Self {
         let opcode = if buf[0] == 1 {
             OpcodeType::Erase
@@ -345,19 +362,82 @@ impl ExecuteOpcode {
             OpcodeType::Save
         };
 
-        let error_code_val = i64::from_le_bytes(buf[56..104].try_into().unwrap());
+        // argument is stored as 6 bytes, the final 2 bytes for a i64 need to be sign-extended from the high bit
+        let mut argbuf: [u8; 8] = [0; 8];
+        argbuf[..6].clone_from_slice(&buf[1..7]);
+        // sign-extend if needed
+        if argbuf[5] & 0x80 == 0x80 {
+            argbuf[6] = 0xff;
+            argbuf[7] = 0xff;
+        }
+        let arg_val = i64::from_le_bytes(argbuf);
+
+        Self {
+            opcode,
+            argument: arg_val,
+        }
+    }
+}
+
+/// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/param/10.ExecuteOpcode.uavcan
+/// Pertains to saving or erasing config to/from flash
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecuteOpcodeResponse {
+    pub error_code: Option<i64>, // 48 bits.
+    pub ok: bool,
+}
+
+impl ExecuteOpcodeResponse {
+    /// serialize `ExecuteOpcodeResponse` to buffer
+    pub fn to_bytes(&self) -> Vec<u8, UAVCAN_PROTOCOL_EXECUTEOPCODE_RESPONSE_SIZE> {
+        let mut buf = Vec::new();
+        let val = self.error_code.unwrap_or(0);
+        buf.extend_from_slice(&val.to_le_bytes()[..6]).unwrap();
+        let val = match self.ok {
+            true => 1,
+            false => 0,
+        };
+        buf.push(val).ok();
+        buf
+    }
+
+    /// construct `ExecuteOpcodeResponse` from buffer
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        // error code is stored as 6 bytes, the final 2 bytes for a i64 need to be sign-extended from the high bit
+        let mut ecbuf: [u8; 8] = [0; 8];
+        ecbuf[..6].clone_from_slice(&buf[..6]);
+        // sign-extend if needed
+        if ecbuf[5] & 0x80 == 0x80 {
+            ecbuf[6] = 0xff;
+            ecbuf[7] = 0xff;
+        }
+        let error_code_val = i64::from_le_bytes(ecbuf);
         let error_code = match error_code_val {
             0 => None,
             _ => Some(error_code_val),
         };
 
         Self {
-            opcode,
             error_code,
-            ok: buf[104] != 0,
+            ok: buf[6] != 0,
         }
     }
 }
+
+////////////////////////////////////////////////////////////////////////////////
+
+// Used to determine which enum (union) variant is used.
+// "Tag is 3 bit long, so outer structure has 5-bit prefix to ensure proper alignment"
+const VALUE_TAG_BIT_LEN: usize = 3;
+const VALUE_NUMERIC_TAG_BIT_LEN: usize = 2;
+// For use in `GetSet`
+const NAME_LEN_BIT_SIZE: usize = 7; // round_up(log2(92+1));
+
+const MAX_GET_SET_NAME_LEN: usize = 50; // not overal max; max we use to keep buf size down
+
+// Size in bits of the value string's size byte (leading byte)
+const VALUE_STRING_LEN_SIZE: usize = 8; // round_up(log2(128+1));
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/param/NumericValue.uavcan
 /// `uavcan.protocol.param.NumericValue`
@@ -828,6 +908,8 @@ pub fn make_getset_response_common<'a>(
     }
 }
 
+////////////////////////////////////////////////////////////////////////////////
+
 /// Maximum size of the Vec for Covariance
 pub const UAVCAN_EQUIPMENT_AHRS_SOLUTION_COVARIANCE_MAX_SIZE: usize = 9;
 
@@ -843,6 +925,8 @@ impl Default for Covariance {
         Self { data: Vec::new() }
     }
 }
+
+////////////////////////////////////////////////////////////////////////////////
 
 /// Maximum size of the Vec for AhrsSolution (variable)
 pub const UAVCAN_EQUIPMENT_AHRS_SOLUTION_MAX_SIZE: usize = 84;
@@ -1064,6 +1148,8 @@ impl AhrsSolution {
     }
 }
 
+////////////////////////////////////////////////////////////////////////////////
+
 /// Maximum size of the Vec for MagneticFieldStrength2
 pub const UAVCAN_EQUIPMENT_AHRS_MAGNETIC_FIELD_STRENGTH2_MAX_SIZE: usize = 26;
 
@@ -1170,6 +1256,8 @@ impl MagneticFieldStrength2 {
     }
 }
 
+////////////////////////////////////////////////////////////////////////////////
+
 /// Maximum size of the Vec for Rgb565
 pub const UAVCAN_EQUIPMENT_INDICATION_RGB565_MAX_SIZE: usize = 2;
 
@@ -1201,6 +1289,8 @@ impl Rgb565 {
         }
     }
 }
+
+////////////////////////////////////////////////////////////////////////////////
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/indication/SingleLightCommand.uavcan
 #[derive(Debug, Clone, PartialEq)]
@@ -1256,6 +1346,8 @@ impl From<LightId> for u8 {
     }
 }
 
+////////////////////////////////////////////////////////////////////////////////
+
 /// Maximum size of the Vec for SingleLightCommand
 pub const UAVCAN_EQUIPMENT_INDICATION_SINGLELIGHTCOMMAND_SIZE: usize = 3;
 
@@ -1284,6 +1376,8 @@ impl SingleLightCommand {
         }
     }
 }
+
+////////////////////////////////////////////////////////////////////////////////
 
 /// Maximum size of the Vec for LightsCommand
 pub const UAVCAN_EQUIPMENT_INDICATION_LIGHTSCOMMAND_MAX_SIZE: usize =
@@ -1317,6 +1411,8 @@ impl LightsCommand {
         Self { data }
     }
 }
+
+////////////////////////////////////////////////////////////////////////////////
 
 #[cfg(test)]
 mod test {
@@ -1469,5 +1565,46 @@ mod test {
         let cmd1back = LightsCommand::from_bytes(&buf);
         assert_eq!(cmd1, cmd1back);
         assert_eq!(cmd1.data[0], lc1);
+    }
+
+    #[test]
+    fn test_executeopcode_request() {
+        let op1 = ExecuteOpcodeRequest {
+            opcode: OpcodeType::Erase,
+            argument: 224,
+        };
+        let buf = op1.to_bytes();
+        assert!(buf.len() == UAVCAN_PROTOCOL_EXECUTEOPCODE_REQUEST_SIZE);
+        let op1back = ExecuteOpcodeRequest::from_bytes(&buf);
+        assert_eq!(op1, op1back);
+
+        let op2 = ExecuteOpcodeRequest {
+            opcode: OpcodeType::Erase,
+            argument: -224,
+        };
+        let buf = op2.to_bytes();
+        assert!(buf.len() == UAVCAN_PROTOCOL_EXECUTEOPCODE_REQUEST_SIZE);
+        let op2back = ExecuteOpcodeRequest::from_bytes(&buf);
+        assert_eq!(op2, op2back);
+    }
+
+    #[test]
+    fn test_executeopcode_response() {
+        let op1 = ExecuteOpcodeResponse {
+            error_code: None,
+            ok: true,
+        };
+        let buf = op1.to_bytes();
+        assert!(buf.len() == UAVCAN_PROTOCOL_EXECUTEOPCODE_RESPONSE_SIZE);
+        let op1back = ExecuteOpcodeResponse::from_bytes(&buf);
+        assert_eq!(op1, op1back);
+        let op2 = ExecuteOpcodeResponse {
+            error_code: Some(-4),
+            ok: false,
+        };
+        let buf = op2.to_bytes();
+        assert!(buf.len() == UAVCAN_PROTOCOL_EXECUTEOPCODE_RESPONSE_SIZE);
+        let op2back = ExecuteOpcodeResponse::from_bytes(&buf);
+        assert_eq!(op2, op2back);
     }
 }

@@ -258,7 +258,7 @@ where
         }?;
 
         let mut crc = TransferCrc::new(base_crc);
-        crc.add_payload(payload, payload.len());
+        crc.add_payload(payload);
         trace!("payload crc:{:?}", crc);
         // See https://dronecan.github.io/Specification/4._CAN_bus_transport_layer/,
         // "Multi-frame transfer" re requirements such as CRC and Toggle bit.

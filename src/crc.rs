@@ -17,6 +17,16 @@ impl TransferCrc {
         Self { value: base }
     }
 
+    /// Constructor doesn't use the message type's base CRC,
+    /// This requires the use of the 'Data Type Signature':
+    /// https://dronecan.github.io/Specification/4.1_CAN_bus_transport_layer/#payload-decomposition
+    /// The result of this can be used as the 'base_crc' calculated in python.
+    pub fn new_with_signature(sig: u64) -> Self {
+        let mut calc = Self { value: 0xFFFF };
+        calc.add_payload(&sig.to_le_bytes());
+        calc
+    }
+
     /// See https://github.com/dronecan/pydronecan/blob/master/dronecan/dsdl/common.py#L50
     /// Verified against the Python lib with a few examples.
     fn add_byte(&mut self, byte: u8) {
@@ -31,9 +41,22 @@ impl TransferCrc {
         }
     }
 
-    pub fn add_payload(&mut self, payload: &[u8], payload_len: usize) {
-        for i in 0..payload_len {
-            self.add_byte(payload[i]);
+    /// Add a buffer to the CRC calculation
+    pub fn add_payload(&mut self, payload: &[u8]) {
+        for b in payload.iter() {
+            self.add_byte(*b);
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_new_with_sig() {
+        // the uavcan_protocol_Panic data type signature
+        let crc_fn = TransferCrc::new_with_signature(0x8B79B4101811C1D7);
+        assert_eq!(crc_fn.value, 64_606);
     }
 }

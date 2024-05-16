@@ -7,7 +7,7 @@
 
 use core::mem;
 
-mod crc;
+pub mod crc;
 pub mod dsdl;
 pub mod gnss;
 pub mod interface;

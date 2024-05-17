@@ -43,9 +43,7 @@ impl TransferCrc {
 
     /// Add a buffer to the CRC calculation
     pub fn add_payload(&mut self, payload: &[u8]) {
-        for b in payload.iter() {
-            self.add_byte(*b);
-        }
+        payload.iter().for_each(|b| self.add_byte(*b));
     }
 }
 

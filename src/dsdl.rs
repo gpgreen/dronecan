@@ -1,6 +1,6 @@
 //! This module contains types associated with specific Dronecan messages.
 
-use crate::{f16, protocol::ConfigCommon, CanError, MsgType};
+use crate::{f16, MsgType};
 use bitvec::prelude::*;
 use heapless::{String, Vec};
 
@@ -8,18 +8,6 @@ use heapless::{String, Vec};
 use defmt::*;
 //#[cfg(not(feature = "defmt"))]
 //use log::*;
-
-// To simplify some logic re trailing values, we only match the first few characters of the param name.
-pub const NAME_CUTOFF: usize = 6;
-
-pub const PARAM_NAME_NODE_ID: &[u8] = "Node ID (desired if dynamic allocation is set)".as_bytes();
-pub const PARAM_NAME_DYNAMIC_ID: &[u8] = "Dynamic ID allocation".as_bytes();
-pub const PARAM_NAME_FD_MODE: &[u8] = "CAN FD enabled".as_bytes();
-pub const PARAM_NAME_BITRATE: &[u8] = "CAN bitrate (see datasheet)".as_bytes();
-
-// This message is sent by Ardupilot; respond with 0 unless you wish to limit
-// or inhibit GPS.
-pub const PARAM_NAME_GPS_TYPE: &[u8] = "GPS_TYPE".as_bytes();
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -427,23 +415,15 @@ impl ExecuteOpcodeResponse {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-// Used to determine which enum (union) variant is used.
-// "Tag is 3 bit long, so outer structure has 5-bit prefix to ensure proper alignment"
-const VALUE_TAG_BIT_LEN: usize = 3;
-const VALUE_NUMERIC_TAG_BIT_LEN: usize = 2;
-// For use in `GetSet`
-const NAME_LEN_BIT_SIZE: usize = 7; // round_up(log2(92+1));
-
-const MAX_GET_SET_NAME_LEN: usize = 50; // not overal max; max we use to keep buf size down
-
-// Size in bits of the value string's size byte (leading byte)
-const VALUE_STRING_LEN_SIZE: usize = 8; // round_up(log2(128+1));
+/// Maximum size of the Vec for NumericValue (variable)
+pub const UAVCAN_PROTOCOL_PARAM_NUMERICVALUE_MAX_SIZE: usize = 9;
+pub const VALUE_NUMERIC_TAG_BIT_LEN: usize = 2;
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/param/NumericValue.uavcan
 /// `uavcan.protocol.param.NumericValue`
-/// 2-bit tag.
+/// 2-bit tag with 6-bit prefix for alignment
 #[cfg_attr(feature = "defmt", derive(Format))]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NumericValue {
     Empty,
     Integer(i64),
@@ -465,10 +445,10 @@ impl NumericValue {
         }
     }
 
-    /// Similar to `Value.to_bits()`.
-    pub fn to_bits(&self, bits: &mut BitSlice<u8, Msb0>, tag_start_i: usize) -> usize {
-        let val_start_i = tag_start_i + VALUE_NUMERIC_TAG_BIT_LEN; // bits
-        bits[tag_start_i..val_start_i].store(self.tag());
+    /// Convert to bits in a buffer, return the number of bits written
+    pub fn to_bits(&self, bits: &mut BitSlice<u8, Lsb0>, start_bit_pos: usize) -> usize {
+        let val_start_i = start_bit_pos + VALUE_NUMERIC_TAG_BIT_LEN; // bits
+        bits[start_bit_pos..val_start_i].store(self.tag());
 
         match self {
             Self::Empty => val_start_i,
@@ -478,35 +458,67 @@ impl NumericValue {
             }
             Self::Real(v) => {
                 // bitvec doesn't support floats.
-                let v_u32 = u32::from_le_bytes(v.to_le_bytes());
-                bits[val_start_i..val_start_i + 32].store_le(v_u32);
+                for (i, byte) in v.to_le_bytes().iter().enumerate() {
+                    let start = val_start_i + i * 8;
+                    bits[start..start + 8].store(*byte);
+                }
                 val_start_i + 32
             }
         }
     }
+
+    /// Construct from a buffer starting from position, return Self and number of bits consumed
+    pub fn from_bits(bits: &BitSlice<u8, Lsb0>, start_bit_pos: usize) -> (Self, usize) {
+        let val_start_i = start_bit_pos + VALUE_NUMERIC_TAG_BIT_LEN; // bits
+        let tag: u8 = bits[start_bit_pos..val_start_i].load();
+        let (_head, rest) = bits.split_at(val_start_i);
+
+        match tag {
+            0 => (NumericValue::Empty, val_start_i),
+            1 => {
+                let (chunk, _rest) = rest.split_at(64);
+                (NumericValue::Integer(chunk.load_le()), val_start_i + 64)
+            }
+            2 => {
+                // bitvec doesn't support floats.
+                let mut b = [0; 4];
+                for (byte, chunk) in b.iter_mut().zip(rest.chunks(8)) {
+                    *byte = chunk.load();
+                }
+                (NumericValue::Real(f32::from_le_bytes(b)), val_start_i + 32)
+            }
+            _ => panic!("tag has max value of 2, was {}", tag),
+        }
+    }
 }
+
+////////////////////////////////////////////////////////////////////////////////
+
+/// Maximum size of the Vec for Value (variable)
+pub const UAVCAN_PROTOCOL_PARAM_VALUE_MAX_SIZE: usize = 130;
+pub const VALUE_TAG_BIT_LEN: usize = 3;
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/param/Value.uavcan
 /// `uavcan.protocol.param.Value`
 /// 3-bit tag with 5-bit prefix for alignment.
 #[cfg_attr(feature = "defmt", derive(Format))]
-#[derive(Debug, Clone, Copy)]
-pub enum Value<'a> {
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
     Empty,
     Integer(i64),
     Real(f32),
     Boolean(bool), // u8 repr
     /// Max length of 128 bytes.
-    String(&'a [u8]),
+    String(heapless::String<128>),
 }
 
-impl<'a> Default for Value<'a> {
+impl Default for Value {
     fn default() -> Self {
         Self::Empty
     }
 }
 
-impl<'a> Value<'a> {
+impl Value {
     fn tag(&self) -> u8 {
         match self {
             Self::Empty => 0,
@@ -517,15 +529,10 @@ impl<'a> Value<'a> {
         }
     }
 
-    /// Modifies a bit array in place, with content from this value.
-    /// Returns current bit index.
-    pub fn to_bits(&self, bits: &mut BitSlice<u8, Msb0>, tag_start_i: usize) -> usize {
-        let val_start_i = tag_start_i + VALUE_TAG_BIT_LEN; // bits
-        bits[tag_start_i..val_start_i].store(self.tag());
-
-        // success value of pdc msg for node id w min and max
-        // [78, 111, 100, 101, 32, 73, 68, 67]
-        // or is it this: [31, 15, 1, 70, 0, 0, 0, 131, 0]
+    /// Convert to bits in a buffer, return the number of bits written
+    pub fn to_bits(&self, bits: &mut BitSlice<u8, Lsb0>, start_bit_pos: usize) -> usize {
+        let val_start_i = start_bit_pos + VALUE_TAG_BIT_LEN; // bits
+        bits[start_bit_pos..val_start_i].store(self.tag());
 
         match self {
             Self::Empty => val_start_i,
@@ -535,245 +542,206 @@ impl<'a> Value<'a> {
             }
             Self::Real(v) => {
                 // bitvec doesn't support floats.
-                let v_u32 = u32::from_le_bytes(v.to_le_bytes());
-                bits[val_start_i..val_start_i + 32].store_le(v_u32);
+                for (i, byte) in v.to_le_bytes().iter().enumerate() {
+                    let start = val_start_i + i * 8;
+                    bits[start..start + 8].store(*byte);
+                }
                 val_start_i + 32
             }
             Self::Boolean(v) => {
-                bits[val_start_i..val_start_i + 8].store_le(*v as u8);
+                let byte = if *v { 1 } else { 0 };
+                bits[val_start_i..val_start_i + 8].store(byte);
                 val_start_i + 8
             }
-            Self::String(v) => {
-                let mut i = val_start_i;
-                bits[i..VALUE_STRING_LEN_SIZE].store_le(v.len());
-                i += VALUE_STRING_LEN_SIZE;
-                for char in *v {
-                    bits[i..i + 8].store_le(*char);
-                    i += 8;
+            Self::String(s) => {
+                let (_head, rest) = bits.split_at_mut(val_start_i + 8);
+                let mut slen = 0;
+                for (byte, chunk) in s.as_bytes().iter().zip(rest.chunks_mut(8)) {
+                    chunk.store(*byte);
+                    slen += 1;
+                    if slen == 128 {
+                        break;
+                    }
                 }
-                i
+                // now store the length
+                bits[val_start_i..val_start_i + 8].store(slen);
+                val_start_i + 8 + 8 * slen
             }
         }
     }
 
-    /// Converts from a bit array, eg one of a larger message. Anchors using bit indexes
-    /// passed as arguments.
-    /// Returns self, and current bit index.
-    pub fn from_bits<E: embedded_can::Error>(
-        bits: &BitSlice<u8, Msb0>,
-        tag_start_i: usize,
-    ) -> Result<(Self, usize), CanError<E>> {
-        let val_start_i = tag_start_i + VALUE_TAG_BIT_LEN;
+    /// Construct from a buffer starting from position, return Self and number of bits consumed
+    pub fn from_bits(bits: &BitSlice<u8, Lsb0>, start_bit_pos: usize) -> (Self, usize) {
+        let val_start_i = start_bit_pos + VALUE_TAG_BIT_LEN; // bits
+        let tag: u8 = bits[start_bit_pos..val_start_i].load();
 
-        Ok(match bits[tag_start_i..val_start_i].load_le::<u8>() {
-            0 => (Self::Empty, val_start_i),
-            1 => (
-                Self::Integer(bits[val_start_i..val_start_i + 64].load_le::<i64>()),
-                val_start_i + 64,
-            ),
+        match tag {
+            0 => (Value::Empty, val_start_i),
+            1 => {
+                let (_head, rest) = bits.split_at(val_start_i);
+                let (chunk, _rest) = rest.split_at(64);
+                (Value::Integer(chunk.load_le()), val_start_i + 64)
+            }
             2 => {
-                // No support for floats in bitvec.
-                let as_u32 = bits[val_start_i..val_start_i + 32].load_le::<u32>();
-                (
-                    Self::Real(f32::from_le_bytes(as_u32.to_le_bytes())),
-                    val_start_i + 32,
-                )
+                // bitvec doesn't support floats.
+                let mut b = [0; 4];
+                let (_head, rest) = bits.split_at(val_start_i);
+                for (byte, chunk) in b.iter_mut().zip(rest.chunks(8)) {
+                    *byte = chunk.load();
+                }
+                (Value::Real(f32::from_le_bytes(b)), val_start_i + 32)
             }
-            3 => (
-                Self::Boolean(bits[val_start_i..val_start_i + 8].load_le::<u8>() != 0),
-                val_start_i + 8,
-            ),
+            3 => {
+                let byte: u8 = bits[val_start_i..val_start_i + 8].load();
+                let v = byte != 0;
+                (Value::Boolean(v), val_start_i + 8)
+            }
             4 => {
-                // todo: Handle non-FD mode that uses TCO
-                let current_i = val_start_i + VALUE_STRING_LEN_SIZE;
-                let _str_len: u8 = bits[val_start_i..current_i].load_le();
-
-                // todo: WTH?
-                (Self::Integer(69), val_start_i + 64)
-                // unimplemented!()
-                // todo: Need to convert bitslice to byte slice.
-                // (Self::String(bits[current_i..current_i + str_len as usize * 8]), current_i)
+                let mut buf: Vec<u8, 128> = Vec::new();
+                let (_head, rest) = bits.split_at(val_start_i + 8);
+                let slen = bits[val_start_i..val_start_i + 8].load();
+                let mut count = 0;
+                for ch in rest.chunks(8) {
+                    let c: u8 = ch.load();
+                    buf.push(c).unwrap();
+                    count += 1;
+                    if count == slen {
+                        break;
+                    }
+                }
+                let s = String::from_utf8(buf).unwrap();
+                (Value::String(s), val_start_i + 8 + 8 * slen as usize)
             }
-            _ => return Err(CanError::PayloadData),
-        })
+            _ => panic!("tag has max value of 4, was {}", tag),
+        }
     }
 }
 
+////////////////////////////////////////////////////////////////////////////////
+
+pub const UAVCAN_PROTOCOL_GETSET_REQUEST_MAX_SIZE: usize = 224;
+
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/param/11.GetSet.uavcan
-pub struct GetSetRequest<'a> {
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Clone, PartialEq)]
+pub struct GetSetRequest {
     pub index: u16, // 13 bits
     /// If set - parameter will be assigned this value, then the new value will be returned.
     /// If not set - current parameter value will be returned.
-    pub value: Value<'a>,
-    // pub name: &'a [u8], // up to 92 bytes.
+    pub value: Value,
     /// Name of the parameter; always preferred over index if nonempty.
-    pub name: [u8; MAX_GET_SET_NAME_LEN], // large enough for many uses
-    pub name_len: usize,
+    pub name: heapless::String<92>,
 }
 
-impl<'a> GetSetRequest<'a> {
-    // pub fn to_bytes(buf: &mut [u8]) -> Self {
-    //     let index
-    //     Self {
-    //         index,
-    //         value,
-    //         name,
-    //     }
-    // }
+impl GetSetRequest {
+    /// serialize `GetSetRequest` to buffer
+    pub fn to_bytes(&self) -> Vec<u8, UAVCAN_PROTOCOL_GETSET_REQUEST_MAX_SIZE> {
+        let mut buf = Vec::new();
+        buf.resize_default(UAVCAN_PROTOCOL_GETSET_REQUEST_MAX_SIZE)
+            .unwrap();
+        let bits = buf.view_bits_mut::<Lsb0>();
+        bits[0..13].store_le(self.index);
+        let current_offset = self.value.to_bits(bits, 13);
+        let name_vec = self.name.clone();
+        let name_buf = name_vec.as_bytes();
+        let slen = name_buf.len();
+        let (_head, rest) = bits.split_at_mut(current_offset);
+        for (byte, chunk) in name_buf.iter().zip(rest.chunks_mut(8)) {
+            chunk.store(*byte);
+        }
+        buf.truncate(current_offset / 8 + slen);
+        buf
+    }
 
-    pub fn from_bytes<E: embedded_can::Error>(
-        buf: &[u8],
-        fd_mode: bool,
-    ) -> Result<Self, CanError<E>> {
-        let bits = buf.view_bits::<Msb0>();
+    /// construct `GetSetRequest` from buffer
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        let bits = buf.view_bits::<Lsb0>();
 
+        // the tag
         let tag_start_i = 13;
         let index: u16 = bits[0..tag_start_i].load_le();
 
-        // `i` in this function is in bits, not bytes.
-        let (value, mut current_i) = Value::from_bits(bits, tag_start_i)?;
+        // the value
+        let (value, current_i) = Value::from_bits(bits, tag_start_i);
 
-        let name_len = if fd_mode {
-            let v = bits[current_i..current_i + NAME_LEN_BIT_SIZE].load_le::<u8>() as usize;
-            current_i += NAME_LEN_BIT_SIZE;
-            v
-        } else {
-            // todo: Figure it out from message len, or infer from 0s.
-            MAX_GET_SET_NAME_LEN // max name len we use
-        };
-
-        let mut name = [0; MAX_GET_SET_NAME_LEN];
-
-        if name_len as usize > name.len() {
-            return Err(CanError::PayloadData);
+        // the name, with tao
+        let (_head, rest) = bits.split_at(current_i);
+        let mut v = Vec::new();
+        for ch in rest.chunks(8) {
+            v.push(ch.load()).unwrap();
         }
+        let name = String::from_utf8(v).unwrap();
 
-        for char_i in 0..name_len {
-            // todo: Why BE here? confirm this is the same for non-FD mode.
-            name[char_i] = bits[current_i..current_i + 8].load_be::<u8>();
-            current_i += 8;
-        }
-
-        Ok(Self {
-            index,
-            value,
-            name,
-            name_len,
-        })
+        Self { index, value, name }
     }
 }
 
+pub const UAVCAN_PROTOCOL_GETSET_RESPONSE_MAX_SIZE: usize = 371;
+
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/param/11.GetSet.uavcan
-pub struct GetSetResponse<'a> {
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Clone, PartialEq)]
+pub struct GetSetResponse {
     /// For set requests, it should contain the actual parameter value after the set request was
     /// executed. The objective is to let the client know if the value could not be updated, e.g.
     /// due to its range violation, etc.
-    pub value: Value<'a>,
-    pub default_value: Value<'a>,
+    pub value: Value,
+    pub default_value: Value,
     pub max_value: NumericValue,
     pub min_value: NumericValue,
     /// Empty name (and/or empty value) in response indicates that there is no such parameter.
-    // pub name: [u8; MAX_GET_SET_NAME_LEN], // large enough for many uses
-    pub name: [u8; MAX_GET_SET_NAME_LEN], // large enough for many uses
-    pub name_len: usize,
-    // pub name: &'a [u8], // up to 92 bytes.
+    pub name: String<92>,
 }
 
-impl<'a> GetSetResponse<'a> {
-    /// Returns array length in bytes.
-    pub fn to_bytes(&self, buf: &mut [u8], fd_mode: bool) -> usize {
-        let bits = buf.view_bits_mut::<Msb0>();
+impl GetSetResponse {
+    /// serialize `GetSetResponse` to buffer
+    pub fn to_bytes(&self) -> Vec<u8, UAVCAN_PROTOCOL_GETSET_RESPONSE_MAX_SIZE> {
+        let mut buf = Vec::new();
+        buf.resize_default(UAVCAN_PROTOCOL_GETSET_RESPONSE_MAX_SIZE)
+            .unwrap();
+        let bits = buf.view_bits_mut::<Lsb0>();
+        let bit_offset = self.value.to_bits(bits, 5);
+        let bit_offset = self.default_value.to_bits(bits, bit_offset + 5);
+        let bit_offset = self.max_value.to_bits(bits, bit_offset + 6);
+        let bit_offset = self.max_value.to_bits(bits, bit_offset + 6);
 
-        let val_tag_start_i = 5; // bits.
-
-        let current_i = self.value.to_bits(bits, val_tag_start_i);
-
-        // 5 is the pad between `value` and `default_value`.
-        let default_value_i = current_i + 5;
-
-        let current_i = self.default_value.to_bits(bits, default_value_i);
-        let max_value_i = current_i + 6;
-
-        let current_i = self.max_value.to_bits(bits, max_value_i);
-        let min_value_i = current_i + 6;
-
-        let current_i = self.min_value.to_bits(bits, min_value_i);
-
-        // In FD mode, we need the len field of name.
-        let mut i_bit = if fd_mode {
-            let mut i_bit = current_i; // bits.
-
-            bits[i_bit..i_bit + NAME_LEN_BIT_SIZE].store_le(self.name_len);
-            i_bit += NAME_LEN_BIT_SIZE;
-
-            i_bit
-        } else {
-            current_i
-        };
-
-        for char in &self.name[..self.name_len] {
-            bits[i_bit..i_bit + 8].store_be(*char);
-            i_bit += 8;
+        // store the name
+        let name_vec = self.name.clone();
+        let name_buf = name_vec.as_bytes();
+        let slen = name_buf.len();
+        let (_head, rest) = bits.split_at_mut(bit_offset);
+        for (byte, chunk) in name_buf.iter().zip(rest.chunks_mut(8)) {
+            chunk.store(*byte);
         }
-
-        crate::bit_size_to_byte_size(i_bit)
+        buf.truncate(bit_offset / 8 + slen);
+        buf
     }
 
-    pub fn from_bytes<E: embedded_can::Error>(buf: &[u8]) -> Result<Self, CanError<E>> {
-        let _bits = buf.view_bits::<Msb0>();
-
-        unimplemented!() // todo: You just need to work thorugh it like with related.
-                         //
-                         // let val_tag_start_i = 5;
-                         // let (value, current_i) = Value::from_bits(bits, val_tag_start_i, &mut [])?; // todo: t str buf
-                         //
-                         //
-                         // // todo: Max, min and default values
-                         // let default_value = Value::Empty;
-                         //
-                         // let max_value_i = default_value_i + VALUE_TAG_BIT_LEN + 6; // Includes pad.
-                         //
-                         // let max_value = NumericValue::Empty;
-                         // let max_value_size = 0; // todo
-                         //
-                         // let min_value = NumericValue::Empty;
-                         // let min_value_size = 0; // todo
-                         // // 2 is tag size of numeric value.
-                         // let min_value_i = max_value_i + 2 + max_value_size + 6;
-                         //
-                         // // todo: Update once you include default values.
-                         // let name_len_i = min_value_i + 2 + min_value_size + 6;
-                         //
-                         // // todo: Name section here is DRY with request.
-                         // let name_start_i = name_len_i + NAME_LEN_BIT_SIZE;
-                         //
-                         // let name_len = bits[name_len_i..name_start_i].load_le::<u8>() as usize;
-                         //
-                         // let mut name = [0; MAX_GET_SET_NAME_LEN];
-                         //
-                         // let mut i = name_start_i; // bits.
-                         //
-                         // i += VALUE_STRING_LEN_SIZE;
-                         //
-                         // if name_len as usize > name.len() {
-                         //     return Err(CanError::PayloadData);
-                         // }
-                         //
-                         // for char_i in 0..name_len {
-                         //     name[char_i] = bits[i..i + 8].load_le::<u8>();
-                         //     i += 8;
-                         // }
-                         //
-                         // Ok(Self {
-                         //     value,
-                         //     default_value,
-                         //     max_value,
-                         //     min_value,
-                         //     name,
-                         //     name_len,
-                         // })
+    /// construct `GetSetResponse` from buffer
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        let bits = buf.view_bits::<Lsb0>();
+        let (value, bit_offset) = Value::from_bits(bits, 5);
+        let (default_value, bit_offset) = Value::from_bits(bits, 5 + bit_offset);
+        let (max_value, bit_offset) = NumericValue::from_bits(bits, 6 + bit_offset);
+        let (min_value, bit_offset) = NumericValue::from_bits(bits, 6 + bit_offset);
+        // get the name, with tao
+        let (_head, rest) = bits.split_at(bit_offset);
+        let mut v = Vec::new();
+        for ch in rest.chunks(8) {
+            v.push(ch.load()).unwrap();
+        }
+        let name = String::from_utf8(v).unwrap();
+        Self {
+            value,
+            default_value,
+            max_value,
+            min_value,
+            name,
+        }
     }
 }
+
+////////////////////////////////////////////////////////////////////////////////
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/DataTypeKind.uavcan
 #[cfg_attr(feature = "defmt", derive(Format))]
@@ -800,7 +768,7 @@ impl IdAllocationData {
         // unique id. Split across payloads if not on FD mode.
         if fd_mode {
             // Must include the 5-bit unique_id len field in FD mode.
-            let bits = result.view_bits_mut::<Msb0>();
+            let bits = result.view_bits_mut::<Lsb0>();
 
             let mut i_bit = 8;
             bits[i_bit..i_bit + 5].store_le(16_u8);
@@ -838,73 +806,6 @@ impl IdAllocationData {
             stage,
             unique_id: buf[1..17].try_into().unwrap(),
         }
-    }
-}
-
-/// Make a GetSet response from common config items. This reduces repetition in node firmware.
-pub fn make_getset_response_common<'a>(
-    config: &ConfigCommon,
-    index: u8,
-) -> Option<GetSetResponse<'a>> {
-    // We load the default config to determine default values.
-    let cfg_default = ConfigCommon::default();
-
-    let mut name = [0; MAX_GET_SET_NAME_LEN];
-
-    match index {
-        0 => {
-            let text = PARAM_NAME_NODE_ID;
-            name[0..text.len()].copy_from_slice(text);
-
-            Some(GetSetResponse {
-                value: Value::Integer(config.node_id as i64),
-                default_value: Value::Integer(cfg_default.node_id as i64),
-                max_value: NumericValue::Integer(127),
-                min_value: NumericValue::Integer(0),
-                name,
-                name_len: text.len(),
-            })
-        }
-        1 => {
-            let text = PARAM_NAME_DYNAMIC_ID;
-            name[0..text.len()].copy_from_slice(text);
-
-            Some(GetSetResponse {
-                value: Value::Boolean(config.dynamic_id_allocation),
-                default_value: Value::Boolean(cfg_default.dynamic_id_allocation),
-                max_value: NumericValue::Empty,
-                min_value: NumericValue::Empty,
-                name,
-                name_len: text.len(),
-            })
-        }
-        2 => {
-            let text = PARAM_NAME_FD_MODE;
-            name[0..text.len()].copy_from_slice(text);
-
-            Some(GetSetResponse {
-                value: Value::Boolean(config.fd_mode),
-                default_value: Value::Boolean(cfg_default.fd_mode),
-                max_value: NumericValue::Empty,
-                min_value: NumericValue::Empty,
-                name,
-                name_len: text.len(),
-            })
-        }
-        // 3 => {
-        //     let text = PARAM_NAME_BITRATE;
-        //     name[0..text.len()].copy_from_slice(text);
-
-        //     Some(GetSetResponse {
-        //         value: Value::Integer(config.can_bitrate as i64),
-        //         default_value: Value::Integer(cfg_default.can_bitrate as i64),
-        //         max_value: NumericValue::Integer(6),
-        //         min_value: NumericValue::Integer(0),
-        //         name,
-        //         name_len: text.len(),
-        //     })
-        // }
-        _ => None,
     }
 }
 
@@ -956,7 +857,7 @@ impl AhrsSolution {
         // copy the timestamp
         buf[..7].clone_from_slice(&self.uavcan_timestamp.to_le_bytes()[0..7]);
 
-        let bits = buf.view_bits_mut::<Msb0>();
+        let bits = buf.view_bits_mut::<Lsb0>();
 
         let bit_index = 56; // bits
 
@@ -1039,7 +940,7 @@ impl AhrsSolution {
         let mut tsbuf: [u8; 8] = [0; 8];
         tsbuf[..7].clone_from_slice(&buf[..7]);
         let uavcan_timestamp = u64::from_le_bytes(tsbuf);
-        let bits = buf.view_bits::<Msb0>();
+        let bits = buf.view_bits::<Lsb0>();
 
         let mut bit_index = 56;
 
@@ -1172,7 +1073,7 @@ impl MagneticFieldStrength2 {
         // copy sensor id
         buf[0] = self.sensor_id;
 
-        let bits = buf.view_bits_mut::<Msb0>();
+        let bits = buf.view_bits_mut::<Lsb0>();
 
         let bit_index = 8; // starting at 8 bits, for rest of message
 
@@ -1213,7 +1114,7 @@ impl MagneticFieldStrength2 {
         // sensor id is 1 byte
         let sensor_id = buf[0];
 
-        let bits = buf.view_bits::<Msb0>();
+        let bits = buf.view_bits::<Lsb0>();
 
         let mut bit_index = 8;
 
@@ -1606,5 +1507,136 @@ mod test {
         assert!(buf.len() == UAVCAN_PROTOCOL_EXECUTEOPCODE_RESPONSE_SIZE);
         let op2back = ExecuteOpcodeResponse::from_bytes(&buf);
         assert_eq!(op2, op2back);
+    }
+
+    #[test]
+    fn test_numeric_value() {
+        // empty
+        let nv1 = NumericValue::Empty;
+        let mut buf = [0; UAVCAN_PROTOCOL_PARAM_NUMERICVALUE_MAX_SIZE];
+        let bits = buf.view_bits_mut::<Lsb0>();
+        let offset = nv1.to_bits(bits, 0);
+        assert_eq!(offset, 2);
+        let (nv1back, new_offset) = NumericValue::from_bits(bits, 0);
+        assert_eq!(nv1, nv1back);
+        assert_eq!(new_offset, 2);
+
+        // integer
+        let nv2 = NumericValue::Integer(-2);
+        let mut buf = [0; UAVCAN_PROTOCOL_PARAM_NUMERICVALUE_MAX_SIZE];
+        let bits = buf.view_bits_mut::<Lsb0>();
+        let offset = nv2.to_bits(bits, 0);
+        assert_eq!(offset, 2 + 64);
+        let (nv2back, new_offset) = NumericValue::from_bits(bits, 0);
+        assert_eq!(nv2, nv2back);
+        assert_eq!(new_offset, 2 + 64);
+
+        // real
+        let nv3 = NumericValue::Real(-2.34);
+        let mut buf = [0; UAVCAN_PROTOCOL_PARAM_NUMERICVALUE_MAX_SIZE];
+        let bits = buf.view_bits_mut::<Lsb0>();
+        let offset = nv3.to_bits(bits, 0);
+        assert_eq!(offset, 2 + 32);
+        let (nv3back, new_offset) = NumericValue::from_bits(bits, 0);
+        assert_eq!(nv3, nv3back);
+        assert_eq!(new_offset, 2 + 32);
+    }
+
+    #[test]
+    fn test_value() {
+        // empty
+        let v1 = Value::Empty;
+        let mut buf = [0; UAVCAN_PROTOCOL_PARAM_VALUE_MAX_SIZE];
+        let bits = buf.view_bits_mut::<Lsb0>();
+        let offset = v1.to_bits(bits, 0);
+        assert_eq!(offset, 3);
+        let (v1back, new_offset) = Value::from_bits(bits, 0);
+        assert_eq!(v1, v1back);
+        assert_eq!(new_offset, 3);
+
+        // integer
+        let v2 = Value::Integer(-2);
+        let mut buf = [0; UAVCAN_PROTOCOL_PARAM_VALUE_MAX_SIZE];
+        let bits = buf.view_bits_mut::<Lsb0>();
+        let offset = v2.to_bits(bits, 0);
+        assert_eq!(offset, 3 + 64);
+        let (v2back, new_offset) = Value::from_bits(bits, 0);
+        assert_eq!(v2, v2back);
+        assert_eq!(new_offset, 3 + 64);
+
+        // real
+        let v3 = Value::Real(-2.34);
+        let mut buf = [0; UAVCAN_PROTOCOL_PARAM_VALUE_MAX_SIZE];
+        let bits = buf.view_bits_mut::<Lsb0>();
+        let offset = v3.to_bits(bits, 0);
+        assert_eq!(offset, 3 + 32);
+        let (v3back, new_offset) = Value::from_bits(bits, 0);
+        assert_eq!(v3, v3back);
+        assert_eq!(new_offset, 3 + 32);
+
+        // boolean
+        let v4 = Value::Boolean(true);
+        let mut buf = [0; UAVCAN_PROTOCOL_PARAM_VALUE_MAX_SIZE];
+        let bits = buf.view_bits_mut::<Lsb0>();
+        let offset = v4.to_bits(bits, 0);
+        assert_eq!(offset, 3 + 8);
+        let (v4back, new_offset) = Value::from_bits(bits, 0);
+        assert_eq!(v4, v4back);
+        assert_eq!(new_offset, 3 + 8);
+
+        // string
+        let s: String<128> = String::try_from("this is a string").unwrap();
+        let slen = s.len();
+        let v5 = Value::String(s);
+        let mut buf = [0; UAVCAN_PROTOCOL_PARAM_VALUE_MAX_SIZE];
+        let bits = buf.view_bits_mut::<Lsb0>();
+        let offset = v5.to_bits(bits, 0);
+        assert_eq!(offset, 3 + 8 + 8 * slen);
+        let (v5back, new_offset) = Value::from_bits(bits, 0);
+        assert_eq!(v5, v5back);
+        assert_eq!(new_offset, 3 + 8 + 8 * slen);
+    }
+
+    #[test]
+    fn test_getset_request() {
+        let gs1 = GetSetRequest {
+            index: 0,
+            value: Value::Empty,
+            name: String::new(),
+        };
+        let buf = gs1.to_bytes();
+        assert_eq!(buf.len(), 2);
+        let gs1back = GetSetRequest::from_bytes(&buf);
+        assert_eq!(gs1, gs1back);
+
+        let gs2 = GetSetRequest {
+            index: 1,
+            value: Value::Integer(3),
+            name: String::try_from("hello world").unwrap(),
+        };
+        let buf = gs2.to_bytes();
+        assert_eq!(buf.len(), 21);
+        let gs2back = GetSetRequest::from_bytes(&buf);
+        assert_eq!(gs2, gs2back);
+
+        let gs3 = GetSetRequest {
+            index: 2,
+            value: Value::Real(3.14),
+            name: String::try_from("pi").unwrap(),
+        };
+        let buf = gs3.to_bytes();
+        assert_eq!(buf.len(), 8);
+        let gs3back = GetSetRequest::from_bytes(&buf);
+        assert_eq!(gs3, gs3back);
+
+        let gs4 = GetSetRequest {
+            index: 3,
+            value: Value::Boolean(false),
+            name: String::try_from("pi is not equal to plancks constant").unwrap(),
+        };
+        let buf = gs4.to_bytes();
+        assert_eq!(buf.len(), 38);
+        let gs4back = GetSetRequest::from_bytes(&buf);
+        assert_eq!(gs4, gs4back);
     }
 }

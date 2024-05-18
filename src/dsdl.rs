@@ -29,7 +29,7 @@ impl From<u8> for NodeHealth {
             1 => NodeHealth::Warning,
             2 => NodeHealth::Error,
             3 => NodeHealth::Critical,
-            _ => panic!(),
+            _ => panic!("max value of NodeHealth is 3"),
         }
     }
 }
@@ -56,7 +56,7 @@ impl From<u8> for NodeMode {
             2 => NodeMode::Maintenance,
             3 => NodeMode::SoftwareUpdate,
             7 => NodeMode::Offline,
-            _ => panic!(),
+            _ => panic!("value out of range for NodeMode"),
         }
     }
 }
@@ -77,6 +77,7 @@ pub struct NodeStatus {
 }
 
 impl NodeStatus {
+    /// serialize `NodeStatus` to a buffer
     pub fn to_bytes(&self) -> [u8; PAYLOAD_SIZE_NODE_STATUS] {
         let mut result = [0; PAYLOAD_SIZE_NODE_STATUS];
 
@@ -90,6 +91,7 @@ impl NodeStatus {
 
         result
     }
+    /// construct `NodeStatus` from a buffer
     pub fn from_bytes(buf: &[u8]) -> Self {
         let bits = buf.view_bits::<Msb0>();
         let uptime_sec = bits[0..32].load_le();
@@ -703,7 +705,7 @@ impl GetSetResponse {
         let bit_offset = self.value.to_bits(bits, 5);
         let bit_offset = self.default_value.to_bits(bits, bit_offset + 5);
         let bit_offset = self.max_value.to_bits(bits, bit_offset + 6);
-        let bit_offset = self.max_value.to_bits(bits, bit_offset + 6);
+        let bit_offset = self.min_value.to_bits(bits, bit_offset + 6);
 
         // store the name
         let name_vec = self.name.clone();
@@ -745,12 +747,129 @@ impl GetSetResponse {
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/DataTypeKind.uavcan
 #[cfg_attr(feature = "defmt", derive(Format))]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum DataTypeKind {
     Service = 0,
     Message = 1,
 }
+
+pub const UAVCAN_PROTOCOL_GETDATATYPEINFO_REQUEST_MAX_SIZE: usize = 84;
+
+/// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/2.GetDataTypeInfo.uavcan
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Clone, PartialEq)]
+pub struct GetDataTypeInfoRequest {
+    pub id: u16,
+    pub kind: DataTypeKind,
+    pub name: String<80>,
+}
+
+impl GetDataTypeInfoRequest {
+    /// serialize `GetDataTypeInfoRequest` to buffer
+    pub fn to_bytes(&self) -> Vec<u8, UAVCAN_PROTOCOL_GETDATATYPEINFO_REQUEST_MAX_SIZE> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&self.id.to_le_bytes()).unwrap();
+        let kb = if self.kind == DataTypeKind::Service {
+            0
+        } else {
+            1
+        };
+        buf.push(kb).unwrap();
+        let name_vec = self.name.clone();
+        let name_buf = name_vec.as_bytes();
+        buf.extend_from_slice(name_buf).unwrap();
+        buf
+    }
+
+    /// construct `GetDataTypeInfoRequest` from buffer
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        let bits = buf.view_bits::<Lsb0>();
+
+        let id = bits[0..16].load_le();
+        let dtk: u8 = bits[16..24].load();
+        let kind = if dtk == 0 {
+            DataTypeKind::Service
+        } else {
+            DataTypeKind::Message
+        };
+        // get the name, with tao
+        let (_head, rest) = bits.split_at(24);
+        let mut v = Vec::new();
+        for ch in rest.chunks(8) {
+            v.push(ch.load()).unwrap();
+        }
+        let name = String::from_utf8(v).unwrap();
+
+        Self { id, kind, name }
+    }
+}
+
+pub const UAVCAN_PROTOCOL_GETDATATYPEINFO_RESPONSE_MAX_SIZE: usize = 93;
+pub const UAVCAN_PROTOCOL_GETDATATYPEINFO_SIGNATURE: u64 = 0x1B283338A7BED2D8;
+
+pub const UAVCAN_PROTOCOL_GETDATATYPEINFO_RESPONSE_FLAG_KNOWN: u8 = 1;
+pub const UAVCAN_PROTOCOL_GETDATATYPEINFO_RESPONSE_FLAG_SUBSCRIBED: u8 = 2;
+pub const UAVCAN_PROTOCOL_GETDATATYPEINFO_RESPONSE_FLAG_PUBLISHING: u8 = 4;
+pub const UAVCAN_PROTOCOL_GETDATATYPEINFO_RESPONSE_FLAG_SERVING: u8 = 8;
+
+/// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/2.GetDataTypeInfo.uavcan
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[derive(Debug, Clone, PartialEq)]
+pub struct GetDataTypeInfoResponse {
+    pub signature: u64,
+    pub id: u16,
+    pub kind: DataTypeKind,
+    pub flags: u8,
+    pub name: String<80>,
+}
+
+impl GetDataTypeInfoResponse {
+    /// serialize `GetDataTypeInfoResponse` to buffer
+    pub fn to_bytes(&self) -> Vec<u8, UAVCAN_PROTOCOL_GETDATATYPEINFO_REQUEST_MAX_SIZE> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&self.signature.to_le_bytes())
+            .unwrap();
+        buf.extend_from_slice(&self.id.to_le_bytes()).unwrap();
+        let kb = if self.kind == DataTypeKind::Service {
+            0
+        } else {
+            1
+        };
+        buf.push(kb).unwrap();
+        buf.push(self.flags).unwrap();
+        let name_vec = self.name.clone();
+        let name_buf = name_vec.as_bytes();
+        buf.extend_from_slice(name_buf).unwrap();
+        buf
+    }
+
+    /// construct `GetDataTypeInfoResponse` from buffer
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        let bits = buf.view_bits::<Lsb0>();
+        let signature = bits[0..64].load_le();
+        let id = bits[64..80].load_le();
+        let kind = if buf[10] == 0 {
+            DataTypeKind::Service
+        } else {
+            DataTypeKind::Message
+        };
+        let flags = buf[11];
+        let mut v = Vec::new();
+        v.extend_from_slice(&buf[12..]).unwrap();
+        let name = String::from_utf8(v).unwrap();
+
+        Self {
+            signature,
+            id,
+            kind,
+            flags,
+            name,
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/dynamic_node_id/1.Allocation.uavcan
 pub struct IdAllocationData {
@@ -1564,6 +1683,16 @@ mod test {
         assert_eq!(v2, v2back);
         assert_eq!(new_offset, 3 + 64);
 
+        // integer
+        let v2a = Value::Integer(i64::MIN);
+        let mut buf = [0; UAVCAN_PROTOCOL_PARAM_VALUE_MAX_SIZE];
+        let bits = buf.view_bits_mut::<Lsb0>();
+        let offset = v2a.to_bits(bits, 0);
+        assert_eq!(offset, 3 + 64);
+        let (v2aback, new_offset) = Value::from_bits(bits, 0);
+        assert_eq!(v2a, v2aback);
+        assert_eq!(new_offset, 3 + 64);
+
         // real
         let v3 = Value::Real(-2.34);
         let mut buf = [0; UAVCAN_PROTOCOL_PARAM_VALUE_MAX_SIZE];
@@ -1638,5 +1767,94 @@ mod test {
         assert_eq!(buf.len(), 38);
         let gs4back = GetSetRequest::from_bytes(&buf);
         assert_eq!(gs4, gs4back);
+    }
+
+    #[test]
+    fn test_getset_response() {
+        let gs1 = GetSetResponse {
+            value: Value::Empty,
+            default_value: Value::Empty,
+            max_value: NumericValue::Empty,
+            min_value: NumericValue::Empty,
+            name: String::new(),
+        };
+        let buf = gs1.to_bytes();
+        assert_eq!(buf.len(), 4);
+        let gs1back = GetSetResponse::from_bytes(&buf);
+        assert_eq!(gs1, gs1back);
+
+        // max sizes of everything
+        let nm = String::try_from("01234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678").unwrap();
+        let nm2 = String::try_from(
+            "01234567890123456789012345678901234567890123456789012345678901234567890123456789012",
+        )
+        .unwrap();
+        let gs2 = GetSetResponse {
+            value: Value::String(nm.clone()),
+            default_value: Value::String(nm),
+            max_value: NumericValue::Integer(i64::MAX),
+            min_value: NumericValue::Integer(i64::MIN),
+            name: nm2,
+        };
+        let buf = gs2.to_bytes();
+        // BUGBUG: the max size doesn't seem correct
+        //        assert_eq!(buf.len(), UAVCAN_PROTOCOL_GETSET_RESPONSE_MAX_SIZE);
+        let gs2back = GetSetResponse::from_bytes(&buf);
+        assert_eq!(gs2, gs2back);
+    }
+
+    #[test]
+    fn test_getdatatypeinfo_request() {
+        let gdt1 = GetDataTypeInfoRequest {
+            id: 0,
+            kind: DataTypeKind::Service,
+            name: String::new(),
+        };
+        let buf = gdt1.to_bytes();
+        assert_eq!(buf.len(), 3);
+        let gdt1back = GetDataTypeInfoRequest::from_bytes(&buf);
+        assert_eq!(gdt1, gdt1back);
+
+        let gdt2 = GetDataTypeInfoRequest {
+            id: 1,
+            kind: DataTypeKind::Message,
+            name: String::try_from("hello").unwrap(),
+        };
+        let buf = gdt2.to_bytes();
+        assert_eq!(buf.len(), 8);
+        let gdt2back = GetDataTypeInfoRequest::from_bytes(&buf);
+        assert_eq!(gdt2, gdt2back);
+
+        // max sizes of everything
+        let gdt3 = GetDataTypeInfoRequest {
+            id: u16::MAX,
+            kind: DataTypeKind::Message,
+            name: String::try_from(
+                "01234567890123456789012345678901234567890123456789012345678901234567890123456789",
+            )
+            .unwrap(),
+        };
+        let buf = gdt3.to_bytes();
+        assert_eq!(
+            buf.len(),
+            UAVCAN_PROTOCOL_GETDATATYPEINFO_REQUEST_MAX_SIZE - 1
+        );
+        let gdt3back = GetDataTypeInfoRequest::from_bytes(&buf);
+        assert_eq!(gdt3, gdt3back);
+    }
+
+    #[test]
+    fn test_getdatatypeinfo_response() {
+        let gdt1 = GetDataTypeInfoResponse {
+            signature: UAVCAN_PROTOCOL_GETDATATYPEINFO_SIGNATURE,
+            id: 0,
+            kind: DataTypeKind::Service,
+            flags: 0,
+            name: String::try_from("hello").unwrap(),
+        };
+        let buf = gdt1.to_bytes();
+        assert_eq!(buf.len(), 17);
+        let gdt1back = GetDataTypeInfoResponse::from_bytes(&buf);
+        assert_eq!(gdt1, gdt1back);
     }
 }

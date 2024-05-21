@@ -21,6 +21,9 @@ bitvec = { version = "1.0.1", default-features = false }
 # for f16 implementation, mimicking `half`'s.
 crunchy = "0.2.2"
 
+# for representing flags in a bitfield, use in no-std way
+bitflags = { version = "2.5.0", default-features = false }
+
 [dev-dependencies]
 test-log = "0.2.15"
 

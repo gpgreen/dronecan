@@ -1,6 +1,7 @@
 //! This module contains types associated with specific Dronecan messages.
 
 use crate::{f16, MsgType};
+use bitflags::bitflags;
 use bitvec::prelude::*;
 use heapless::{String, Vec};
 
@@ -185,6 +186,18 @@ impl HardwareVersion {
 /// Size of payload for SoftwareVersion (fixed)
 pub const PAYLOAD_SIZE_SOFTWARE_VERSION: usize = 15;
 
+bitflags! {
+    /// Optional field flags in `SoftwareVersion`
+    #[cfg_attr(feature = "defmt", derive(Format))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct FieldFlags: u8 {
+        /// The value `VCS_COMMIT` at bit position `0`
+        const VCS_COMMIT = 0b0000_0001;
+        /// The value `IMAGE_CRC` at bit position `1`
+        const IMAGE_CRC = 0b0000_0010;
+    }
+}
+
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/SoftwareVersion.uavcan
 /// Generic software version information.
 #[cfg_attr(feature = "defmt", derive(Format))]
@@ -192,10 +205,8 @@ pub const PAYLOAD_SIZE_SOFTWARE_VERSION: usize = 15;
 pub struct SoftwareVersion {
     pub major: u8,
     pub minor: u8,
-    /// This mask indicates which optional fields (see below) are set.
-    /// u8 OPTIONAL_FIELD_FLAG_VCS_COMMIT = 1
-    /// u8 OPTIONAL_FIELD_FLAG_IMAGE_CRC = 2
-    pub optional_field_flags: u8,
+    /// `FieldFlags` mask indicates which optional fields (see below) are set.
+    pub optional_field_flags: FieldFlags,
     /// VCS commit hash or revision number, e.g. git short commit hash. Optional.
     pub vcs_commit: u32,
     /// The value of an arbitrary hash function applied to the firmware image.
@@ -209,7 +220,7 @@ impl SoftwareVersion {
 
         result[0] = self.major;
         result[1] = self.minor;
-        result[2] = self.optional_field_flags;
+        result[2] = self.optional_field_flags.bits();
         result[3..7].clone_from_slice(&self.vcs_commit.to_le_bytes());
         result[7..15].clone_from_slice(&self.image_crc.to_le_bytes());
 
@@ -224,7 +235,7 @@ impl SoftwareVersion {
         Self {
             major: buf[0],
             minor: buf[1],
-            optional_field_flags: buf[2],
+            optional_field_flags: FieldFlags::from_bits_truncate(buf[2]),
             vcs_commit,
             image_crc,
         }
@@ -808,19 +819,35 @@ impl GetDataTypeInfoRequest {
 pub const UAVCAN_PROTOCOL_GETDATATYPEINFO_RESPONSE_MAX_SIZE: usize = 93;
 pub const UAVCAN_PROTOCOL_GETDATATYPEINFO_SIGNATURE: u64 = 0x1B283338A7BED2D8;
 
-pub const UAVCAN_PROTOCOL_GETDATATYPEINFO_RESPONSE_FLAG_KNOWN: u8 = 1;
-pub const UAVCAN_PROTOCOL_GETDATATYPEINFO_RESPONSE_FLAG_SUBSCRIBED: u8 = 2;
-pub const UAVCAN_PROTOCOL_GETDATATYPEINFO_RESPONSE_FLAG_PUBLISHING: u8 = 4;
-pub const UAVCAN_PROTOCOL_GETDATATYPEINFO_RESPONSE_FLAG_SERVING: u8 = 8;
+bitflags! {
+    /// Data Type Info flags in `GetDataTypeInfoResponse`
+    #[cfg_attr(feature = "defmt", derive(Format))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct DataTypeFlags: u8 {
+        /// The value `KNOWN` at bit position `0`
+        const KNOWN = 0b0000_0001;
+        /// The value `SUBSCRIBED` at bit position `1`
+        const SUBSCRIBED = 0b0000_0010;
+        /// The value `PUBLISHING` at bit position `2`
+        const PUBLISHING = 0b0000_0100;
+        /// The value `SERVING` at bit position `3`
+        const SERVING = 0b0000_1000;
+    }
+}
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/2.GetDataTypeInfo.uavcan
 #[cfg_attr(feature = "defmt", derive(Format))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct GetDataTypeInfoResponse {
+    /// UAVCAN signature of the Data Type
     pub signature: u64,
+    /// The Id of the Data Type
     pub id: u16,
+    /// What Kind of Data Type
     pub kind: DataTypeKind,
-    pub flags: u8,
+    /// Flags describing Data Type
+    pub flags: DataTypeFlags,
+    /// Name of the Data Type
     pub name: String<80>,
 }
 
@@ -837,7 +864,7 @@ impl GetDataTypeInfoResponse {
             1
         };
         buf.push(kb).unwrap();
-        buf.push(self.flags).unwrap();
+        buf.push(self.flags.bits()).unwrap();
         let name_vec = self.name.clone();
         let name_buf = name_vec.as_bytes();
         buf.extend_from_slice(name_buf).unwrap();
@@ -854,7 +881,7 @@ impl GetDataTypeInfoResponse {
         } else {
             DataTypeKind::Message
         };
-        let flags = buf[11];
+        let flags = DataTypeFlags::from_bits_truncate(buf[11]);
         let mut v = Vec::new();
         v.extend_from_slice(&buf[12..]).unwrap();
         let name = String::from_utf8(v).unwrap();
@@ -1484,7 +1511,7 @@ mod test {
         let sw1 = SoftwareVersion {
             major: 1,
             minor: 1,
-            optional_field_flags: 0x3,
+            optional_field_flags: FieldFlags::VCS_COMMIT | FieldFlags::IMAGE_CRC,
             vcs_commit: 2344,
             image_crc: u64::MAX,
         };
@@ -1849,7 +1876,7 @@ mod test {
             signature: UAVCAN_PROTOCOL_GETDATATYPEINFO_SIGNATURE,
             id: 0,
             kind: DataTypeKind::Service,
-            flags: 0,
+            flags: DataTypeFlags::empty(),
             name: String::try_from("hello").unwrap(),
         };
         let buf = gdt1.to_bytes();

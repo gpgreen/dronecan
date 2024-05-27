@@ -133,6 +133,16 @@ pub struct HardwareVersion {
 }
 
 impl HardwareVersion {
+    /// Create a `HardwareVersion`
+    pub fn new(major: u8, minor: u8, unique_id: &[u8; 16]) -> Self {
+        HardwareVersion {
+            major,
+            minor,
+            unique_id: *unique_id,
+            certificate_of_authority: None,
+        }
+    }
+
     /// serialize `HardwareVersion` to buffer
     pub fn to_bytes(&self) -> Vec<u8, HARDWARE_VERSION_MAX_SIZE> {
         let mut buf = Vec::new();
@@ -214,6 +224,33 @@ pub struct SoftwareVersion {
 }
 
 impl SoftwareVersion {
+    /// Create a `SoftwareVersion`
+    pub fn new(major: u8, minor: u8) -> Self {
+        SoftwareVersion {
+            major,
+            minor,
+            optional_field_flags: FieldFlags::empty(),
+            vcs_commit: 0,
+            image_crc: 0,
+        }
+    }
+
+    /// Set the vcs_commit and image crc
+    /// if the value is zero, that member will be unset
+    pub fn set_vcs_and_crc(&mut self, commit: u32, crc: u64) {
+        if commit != 0 {
+            self.optional_field_flags |= FieldFlags::VCS_COMMIT;
+        } else {
+            self.optional_field_flags &= !FieldFlags::VCS_COMMIT;
+        }
+        if crc != 0 {
+            self.optional_field_flags |= FieldFlags::IMAGE_CRC;
+        } else {
+            self.optional_field_flags &= !FieldFlags::IMAGE_CRC;
+        }
+        self.image_crc = crc;
+    }
+
     /// serialize `SoftwareVersion` to a buffer
     pub fn to_bytes(&self) -> [u8; PAYLOAD_SIZE_SOFTWARE_VERSION] {
         let mut result = [0; 15];

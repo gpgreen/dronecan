@@ -2,7 +2,8 @@
 
 use packed_struct::prelude::*;
 
-use crate::{f16, messages::MsgType};
+use crate::messages::MsgType;
+use half::f16;
 
 #[derive(Clone, Copy, PrimitiveEnum_u8)]
 #[repr(u8)]

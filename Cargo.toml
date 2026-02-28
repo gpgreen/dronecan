@@ -3,7 +3,7 @@ authors = ["Greg Green <ggreen@bit-builder.com>", "David O'Connor <the_alchemist
 name = "dronecan"
 version = "0.1.0"
 edition = "2021"
-
+rust-version = "1.83"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -11,15 +11,15 @@ embedded-can = "0.4.1"
 defmt = { version = "0.3.4", optional = true }
 heapless = "0.8.0"
 log = "0.4.21"
+nb = "1"
+# for f16 implementation
+half = "2.7.1"
 
 # For the tightly-packed and many-fielded Fix2.
-packed_struct = {version = "^0.10.1", default_features = false }
+packed_struct = {version = "^0.10.1", default-features = false }
 # We use bitvec for serializing and deserializing standard DroneCan DSDL
 # types that use dynamic-sized arrays; these are unable to be tackled by PackedStruct.
 bitvec = { version = "1.0.1", default-features = false }
-
-# for f16 implementation, mimicking `half`'s.
-crunchy = "0.2.2"
 
 # for representing flags in a bitfield, use in no-std way
 bitflags = { version = "2.5.0", default-features = false }

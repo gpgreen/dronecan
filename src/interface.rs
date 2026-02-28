@@ -10,6 +10,7 @@ use bitvec::prelude::*;
 use embedded_can;
 use heapless::{Deque, FnvIndexMap, Vec};
 use log::*;
+use nb;
 
 pub(crate) const DATA_FRAME_MAX_LEN_LEGACY: usize = 8;
 pub(crate) const MAX_RX_FRAMES_LEGACY: usize = 24;
@@ -108,7 +109,7 @@ pub struct UavcanInterface<CAN, FRAME> {
 
 impl<CAN, FRAME, E> UavcanInterface<CAN, FRAME>
 where
-    CAN: embedded_can::blocking::Can<Frame = FRAME, Error = E>,
+    CAN: embedded_can::nb::Can<Frame = FRAME, Error = E>,
     FRAME: embedded_can::Frame,
     E: embedded_can::Error,
 {
@@ -136,7 +137,13 @@ where
     pub fn can_send(&mut self) -> Result<(), CanError<E>> {
         while let Some(frame) = self.tx_queue.pop_front() {
             for iface in self.iface.iter_mut() {
-                iface.transmit(&frame)?;
+                // TODO: this method can return a lower priority frame
+                // that is kicked out for this one, we are just dropping
+                // them, the protocol should be able to handle the
+                // skipped over frames
+                if let Some(_msg) = nb::block!(iface.transmit(&frame))? {
+                    error!("Dropping lower priority frame on one controller");
+                }
             }
         }
         Ok(())
@@ -469,7 +476,7 @@ where
 mod test {
     use super::*;
     use core::convert::Infallible;
-    use embedded_can::{blocking::Can, ExtendedId, Frame, Id};
+    use embedded_can::{nb::Can, ExtendedId, Frame, Id};
     use test_log::test;
 
     /// MockFrame
@@ -547,13 +554,16 @@ mod test {
         type Frame = MockFrame;
         type Error = Infallible;
 
-        fn transmit(&mut self, frame: &Self::Frame) -> Result<(), Self::Error> {
+        fn transmit(
+            &mut self,
+            frame: &Self::Frame,
+        ) -> nb::Result<Option<Self::Frame>, Self::Error> {
             assert_eq!(*frame, self.expected_tx[self.tx_index]);
             self.tx_index += 1;
-            Ok(())
+            Ok(None)
         }
 
-        fn receive(&mut self) -> Result<Self::Frame, Self::Error> {
+        fn receive(&mut self) -> nb::Result<Self::Frame, Self::Error> {
             let frame = self.expected_rx[self.rx_index].clone();
             self.rx_index += 1;
             Ok(frame)

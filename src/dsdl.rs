@@ -1,8 +1,9 @@
 //! This module contains types associated with specific Dronecan messages.
 
-use crate::{f16, MsgType};
+use crate::MsgType;
 use bitflags::bitflags;
 use bitvec::prelude::*;
+use half::f16;
 use heapless::{String, Vec};
 
 #[cfg(feature = "defmt")]
@@ -1131,8 +1132,7 @@ impl AhrsSolution {
         let mut orientation_xyzw = [0_f32; 4];
         let (_head, rest) = bits.split_at(bit_index);
         for (slot, f) in rest.chunks(16).zip(orientation_xyzw.iter_mut()) {
-            let v: u16 = slot.load_le();
-            let sf = f16 { bits: v };
+            let sf = f16::from_bits(slot.load_le());
             *f = sf.to_f32();
         }
         bit_index += 4 * 16;
@@ -1151,8 +1151,7 @@ impl AhrsSolution {
                 if i == len {
                     break;
                 }
-                let v: u16 = slot.load_le();
-                let sf = f16 { bits: v };
+                let sf = f16::from_bits(slot.load_le());
                 orientation_covariance.data.push(sf.to_f32()).ok();
             }
         }
@@ -1162,8 +1161,7 @@ impl AhrsSolution {
         let mut angular_velocity = [0_f32; 3];
         let (_head, rest) = bits.split_at(bit_index);
         for (slot, f) in rest.chunks(16).zip(angular_velocity.iter_mut()) {
-            let v: u16 = slot.load_le();
-            let sf = f16 { bits: v };
+            let sf = f16::from_bits(slot.load_le());
             *f = sf.to_f32();
         }
         bit_index += 3 * 16;
@@ -1182,8 +1180,7 @@ impl AhrsSolution {
                 if i == len {
                     break;
                 }
-                let v: u16 = slot.load_le();
-                let sf = f16 { bits: v };
+                let sf = f16::from_bits(slot.load_le());
                 angular_velocity_covariance.data.push(sf.to_f32()).ok();
             }
         }
@@ -1193,8 +1190,7 @@ impl AhrsSolution {
         let mut linear_acceleration = [0_f32; 3];
         let (_head, rest) = bits.split_at(bit_index);
         for (slot, f) in rest.chunks(16).zip(linear_acceleration.iter_mut()) {
-            let v: u16 = slot.load_le();
-            let sf = f16 { bits: v };
+            let sf = f16::from_bits(slot.load_le());
             *f = sf.to_f32();
         }
         bit_index += 3 * 16;
@@ -1214,8 +1210,7 @@ impl AhrsSolution {
                     if i == len {
                         break;
                     }
-                    let v: u16 = slot.load_le();
-                    let sf = f16 { bits: v };
+                    let sf = f16::from_bits(slot.load_le());
                     linear_acceleration_covariance.data.push(sf.to_f32()).ok();
                 }
             }
@@ -1305,8 +1300,7 @@ impl MagneticFieldStrength2 {
         let mut magnetic_field_ga = [0_f32; 3];
         let (_head, rest) = bits.split_at(bit_index);
         for (slot, f) in rest.chunks(16).zip(magnetic_field_ga.iter_mut()) {
-            let v: u16 = slot.load_le();
-            let sf = f16 { bits: v };
+            let sf = f16::from_bits(slot.load_le());
             *f = sf.to_f32();
         }
         bit_index += 3 * 16;
@@ -1326,8 +1320,7 @@ impl MagneticFieldStrength2 {
                     if i == len {
                         break;
                     }
-                    let v: u16 = slot.load_le();
-                    let sf = f16 { bits: v };
+                    let sf = f16::from_bits(slot.load_le());
                     magnetic_field_covariance.data.push(sf.to_f32()).ok();
                 }
             }

@@ -6,13 +6,11 @@
 use defmt::*;
 
 use crate::{
-    dsdl::PAYLOAD_SIZE_NODE_STATUS, dsdl::UAVCAN_EQUIPMENT_AHRS_MAGNETIC_FIELD_STRENGTH2_MAX_SIZE,
+    CanError, MsgPriority, PAYLOAD_SIZE_CONFIG_COMMON, dsdl::PAYLOAD_SIZE_NODE_STATUS,
+    dsdl::UAVCAN_EQUIPMENT_AHRS_MAGNETIC_FIELD_STRENGTH2_MAX_SIZE,
     dsdl::UAVCAN_EQUIPMENT_AHRS_SOLUTION_MAX_SIZE,
-    dsdl::UAVCAN_EQUIPMENT_INDICATION_LIGHTSCOMMAND_MAX_SIZE, MsgPriority,
-    PAYLOAD_SIZE_CONFIG_COMMON,
+    dsdl::UAVCAN_EQUIPMENT_INDICATION_LIGHTSCOMMAND_MAX_SIZE,
 };
-
-pub struct ParseError {}
 
 /// Dronecan Message Type
 #[cfg_attr(feature = "defmt", derive(Format))]
@@ -106,7 +104,9 @@ impl MsgType {
     }
 
     /// Inverse of `id`, noting that when there is a shared ID, choose one variant arbitrarily.
-    pub const fn from_id(id: u16) -> Result<Self, ParseError> {
+    pub const fn from_id<E: embedded_can::Error + core::fmt::Debug>(
+        id: u16,
+    ) -> Result<Self, CanError<E>> {
         Ok(match id {
             1 => Self::IdAllocation,
             4 => Self::GlobalTimeSync,
@@ -143,7 +143,7 @@ impl MsgType {
             3_124 => Self::PowerStats,
             1_091 => Self::CircuitStatus,
             1_090 => Self::PowerSupplyStatus,
-            _ => return Err(ParseError {}),
+            _ => return Err(CanError::UnimplementedUavCanId),
         })
     }
 

@@ -1,10 +1,10 @@
 //! This module contains code related to sending and receiving DroneCAN frames over CAN.
 
 use crate::{
+    CanError,
     crc::TransferCrc,
     messages::MsgType,
     protocol::{CanId, FrameType, RequestResponse, TailByte, TransferComponent},
-    CanError,
 };
 use bitvec::prelude::*;
 use embedded_can;
@@ -60,11 +60,7 @@ impl TransferDesc {
         if a > MAX_VALUE || b > MAX_VALUE {
             panic!();
         }
-        if a > b {
-            MAX_VALUE - a + b + 1
-        } else {
-            b - a
-        }
+        if a > b { MAX_VALUE - a + b + 1 } else { b - a }
     }
 
     /// Get the transfer_id
@@ -340,7 +336,13 @@ where
 
     /// Handle a new received frame. This returns a `RxPayload` containing data relevant to the assembled payload
     /// if this is the last frame in a multi-frame transfer, or if it's a single-frame transfer.
-    /// Returns None if frame is ignored for state reasons, or in the middle of a multi-frame payload
+    /// Returns None if frame is ignored for state reasons, or in the middle of a multi-frame payload.
+    /// Returns an error if the CRC doesn't match after the last frame is received.
+    /// Returns an error if the TransferMap is full, no more slots for TransferDescriptors
+    /// Returns an error if the payload buffer is full
+    /// Returns an error if there is no MsgType for this frame
+    ///
+    /// Panics
     ///
     /// see algorithm at [The DroneCAN spec, transport layer page](https://dronecan.github.io/Specification/4._CAN_bus_transport_layer/)
     pub fn handle_rx_frame(
@@ -380,8 +382,15 @@ where
                 < TransferDesc::TRANSFER_ID_HALF_RANGE;
         let not_previous_tid =
             TransferDesc::compute_forward_distance(tail_byte.transfer_id, txf_desc.transfer_id) > 1;
-        trace!("initialized:{} tid_timed_out:{} iface_switch_allowed:{} same_iface:{} non_wrapped_tid:{} not_previous_tid:{}",
-               self.initialized, tid_timed_out, iface_switch_allowed, same_iface, non_wrapped_tid, not_previous_tid);
+        trace!(
+            "initialized:{} tid_timed_out:{} iface_switch_allowed:{} same_iface:{} non_wrapped_tid:{} not_previous_tid:{}",
+            self.initialized,
+            tid_timed_out,
+            iface_switch_allowed,
+            same_iface,
+            non_wrapped_tid,
+            not_previous_tid
+        );
 
         // check the state flags, deciding whether to restart
         if !self.initialized
@@ -454,6 +463,15 @@ where
                 payload_buffer
                     .extend_from_slice(&txf_desc.payload.as_slice()[2..])
                     .unwrap();
+                // check the crc
+                if let Some(payload_crc) = payload_crc {
+                    let msg_type = MsgType::from_id(can_id.type_id)?;
+                    let mut crc_calc = TransferCrc::new(msg_type.base_crc());
+                    crc_calc.add_payload(&payload_buffer);
+                    if crc_calc.value != payload_crc {
+                        return Err(CanError::MultiFrameCrcMismatch);
+                    }
+                }
                 RxPayload {
                     transfer_id: txf_desc.transfer_id,
                     ts: txf_desc.ts,
@@ -476,7 +494,7 @@ where
 mod test {
     use super::*;
     use core::convert::Infallible;
-    use embedded_can::{nb::Can, ExtendedId, Frame, Id};
+    use embedded_can::{ExtendedId, Frame, Id, nb::Can};
     use test_log::test;
 
     /// MockFrame

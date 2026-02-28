@@ -31,6 +31,17 @@ pub fn bit_size_to_byte_size(len_bits: usize) -> usize {
     }
 }
 
+/// Random number generator, used in Anonymous messages, for now we are returning
+/// a constant
+pub fn random_u32() -> u32 {
+    // TODO: a random number generator
+    // 14-bit discriminator. Discriminator should be random. We use the RNG peripheral.
+    // Once set, we keep it.
+    //#[cfg(feature = "hal")]
+    //let discriminator = (rng::read() & 0b11_1111_1111_1111) as u32;
+    335
+}
+
 /// Errors that can occur in dronecan
 #[cfg_attr(feature = "defmt", derive(Format))]
 #[derive(Debug, Clone)]
@@ -42,6 +53,10 @@ pub enum CanError<E: embedded_can::Error + core::fmt::Debug> {
     TransferMapFull,
     RxPayloadBufferFull,
     TxPayloadBufferFull,
+    /// multi frame payload CRC doesn't match calculated value
+    MultiFrameCrcMismatch,
+    /// Library is not aware of this Id found in can frame
+    UnimplementedUavCanId,
 }
 
 impl<E: embedded_can::Error> From<E> for CanError<E> {
@@ -52,11 +67,20 @@ impl<E: embedded_can::Error> From<E> for CanError<E> {
 
 #[cfg(test)]
 mod test {
-    //    use super::*;
+    use super::*;
     use test_log::test;
 
     #[test]
-    fn test_it() {
-        assert!(true);
+    fn test_bit_size() {
+        assert_eq!(bit_size_to_byte_size(0), 0);
+        assert_eq!(bit_size_to_byte_size(1), 1);
+        assert_eq!(bit_size_to_byte_size(2), 1);
+        assert_eq!(bit_size_to_byte_size(3), 1);
+        assert_eq!(bit_size_to_byte_size(4), 1);
+        assert_eq!(bit_size_to_byte_size(5), 1);
+        assert_eq!(bit_size_to_byte_size(6), 1);
+        assert_eq!(bit_size_to_byte_size(7), 1);
+        assert_eq!(bit_size_to_byte_size(8), 1);
+        assert_eq!(bit_size_to_byte_size(9), 2);
     }
 }

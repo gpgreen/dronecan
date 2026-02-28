@@ -1,4 +1,4 @@
-use crate::PAYLOAD_SIZE_CONFIG_COMMON;
+use crate::{PAYLOAD_SIZE_CONFIG_COMMON, random_u32};
 
 // Per DC spec.
 pub const NODE_ID_MIN_VALUE: u8 = 1;
@@ -275,14 +275,8 @@ impl CanId {
             }
             // FrameType::MessageAnon(discriminator) => {
             FrameType::MessageAnon => {
-                // 14-bit discriminator. Discriminator should be random. We use the RNG peripheral.
-                // Once set, we keep it.
-                #[cfg(feature = "hal")]
-                let discriminator = (rng::read() & 0b11_1111_1111_1111) as u32;
-                #[cfg(not(feature = "hal"))]
-                let discriminator = 335;
-
-                result |= (discriminator << 10) | ((self.type_id & 0b11) as u32) << 8;
+                result |=
+                    (random_u32() << 10) | ((self.type_id & 0b0000_0000_0000_0011) as u32) << 8;
             }
             FrameType::Service(service_data) => {
                 result |= ((self.type_id as u32) << 16)
@@ -309,7 +303,7 @@ impl CanId {
             0 => match source_node_id {
                 0 => {
                     frame_type = FrameType::MessageAnon;
-                    ((val >> 8) & 0b11) as u16
+                    ((val >> 8) & 0b0000_0000_0000_0011) as u16
                 }
                 _ => (val >> 8) as u16,
             },
@@ -387,21 +381,18 @@ mod test {
         assert_eq!(canid2, reversed);
     }
 
-    // #[test]
-    // fn test_canid_anon_msg_convert() {
-    //     let id1 = 0b0000_0001_0110_0101_1111_1111_1000_0010; // 0x165FF82
-    //     let canid1 = CanId {
-    //         priority: MsgPriority::Immediate,
-    //         type_id: 101,
-    //         source_node_id: 2,
-    //         frame_type: FrameType::Service(ServiceData {
-    //             dest_node_id: 127,
-    //             req_or_resp: RequestResponse::Request,
-    //         }),
-    //     };
-    //     let canid1_val = canid1.value();
-    //     assert_eq!(canid1_val, id1);
-    //     let reversed = CanId::from_value(canid1_val);
-    //     assert_eq!(canid1, reversed);
-    // }
+    #[test]
+    fn test_canid_anon_msg_convert() {
+        let id1 = 0b0000_0001_0000_0101_0011_1100_0000_0010; // 0x1053c02
+        let canid1 = CanId {
+            priority: MsgPriority::Immediate,
+            type_id: 0,
+            source_node_id: 2,
+            frame_type: FrameType::MessageAnon,
+        };
+        let canid1_val = canid1.value();
+        assert_eq!(canid1_val, id1);
+        let reversed = CanId::from_value(canid1_val);
+        assert_eq!(canid1, reversed);
+    }
 }

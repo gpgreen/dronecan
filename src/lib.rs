@@ -11,10 +11,12 @@ pub mod gnss;
 pub mod interface;
 pub mod messages;
 pub mod protocol;
+pub mod uavcan_reactor;
 
 pub use interface::*;
 pub use messages::*;
 pub use protocol::*;
+pub use uavcan_reactor::*;
 
 pub const PAYLOAD_SIZE_CONFIG_COMMON: usize = 4;
 

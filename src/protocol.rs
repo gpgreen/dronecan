@@ -250,23 +250,12 @@ pub struct CanId {
 impl CanId {
     /// Get the raw u32 value of the CanId as used in the frame
     pub fn value(&self) -> u32 {
-        let (priority_bits, priority_shift) = (self.priority.val() as u32 & 0b1_1111, 24);
+        let mut result = (self.priority.val() as u32 & 0b1_1111) << 24;
 
-        // The `&` operations are to enforce the smaller-bit-count allowed than the datatype allows.
-
-        // let frame_type_val = if let FrameType::Service(ServiceData {
-        //     dest_node_id: _,
-        //     req_or_resp: RequestResponse::Request,
-        // }) = self.frame_type
-        // {
-        //     0x800000
-        // } else {
-        //     0
-        // };
-
-        let mut result = (priority_bits << priority_shift)
-//            | frame_type_val
-            | ((self.source_node_id & 0b111_1111) as u32);
+        // add source_node_id if not anonymous
+        if self.frame_type != FrameType::MessageAnon {
+            result |= (self.source_node_id & 0b111_1111) as u32;
+        }
 
         // The middle 16 bits vary depending on frame type.
         match &self.frame_type {

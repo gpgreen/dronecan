@@ -1,10 +1,10 @@
 //! This module contains code related to sending and receiving DroneCAN frames over CAN.
 
 use crate::{
-    CanError,
     crc::TransferCrc,
     messages::MsgType,
     protocol::{CanId, FrameType, RequestResponse, TailByte, TransferComponent},
+    CanError,
 };
 use bitvec::prelude::*;
 use embedded_can;
@@ -60,7 +60,11 @@ impl TransferDesc {
         if a > MAX_VALUE || b > MAX_VALUE {
             panic!();
         }
-        if a > b { MAX_VALUE - a + b + 1 } else { b - a }
+        if a > b {
+            MAX_VALUE - a + b + 1
+        } else {
+            b - a
+        }
     }
 
     /// Get the transfer_id
@@ -350,7 +354,7 @@ where
         iface_index: usize,
         can_id: &CanId,
         frame: &FRAME,
-        frame_ts: u64,
+        frame_ts: &u64,
     ) -> Result<Option<RxPayload>, CanError<E>> {
         // get the tail byte
         let tail_byte = TailByte::from_value(frame.data()[frame.dlc() - 1]);
@@ -428,7 +432,7 @@ where
             return Ok(None);
         }
         if tail_byte.start_of_transfer {
-            txf_desc.ts = frame_ts;
+            txf_desc.ts = *frame_ts;
             txf_desc.iface_index = iface_index;
         }
 
@@ -494,7 +498,7 @@ where
 mod test {
     use super::*;
     use core::convert::Infallible;
-    use embedded_can::{ExtendedId, Frame, Id, nb::Can};
+    use embedded_can::{nb::Can, ExtendedId, Frame, Id};
     use test_log::test;
 
     /// MockFrame
@@ -717,7 +721,7 @@ mod test {
             _ => None,
         }
         .unwrap();
-        let rx_res = uav.handle_rx_frame(0, &can_id, &frame, 10);
+        let rx_res = uav.handle_rx_frame(0, &can_id, &frame, &10);
         if let Ok(Some(rx)) = rx_res {
             assert_eq!(rx.transfer_id, 0);
             assert_eq!(rx.ts, 10);
@@ -732,7 +736,7 @@ mod test {
             _ => None,
         }
         .unwrap();
-        let rx_res = uav.handle_rx_frame(0, &can_id, &frame, 20);
+        let rx_res = uav.handle_rx_frame(0, &can_id, &frame, &20);
         if let Ok(Some(rx)) = rx_res {
             assert_eq!(rx.transfer_id, 1);
             assert_eq!(rx.ts, 20);
@@ -749,7 +753,7 @@ mod test {
             _ => None,
         }
         .unwrap();
-        let rx_res = uav.handle_rx_frame(0, &can_id, &frame, 40);
+        let rx_res = uav.handle_rx_frame(0, &can_id, &frame, &40);
         if let Ok(Some(_rx)) = rx_res {
             assert!(false);
         };
@@ -759,7 +763,7 @@ mod test {
             _ => None,
         }
         .unwrap();
-        let rx_res = uav.handle_rx_frame(0, &can_id, &frame, 45);
+        let rx_res = uav.handle_rx_frame(0, &can_id, &frame, &45);
         if let Ok(Some(rx)) = rx_res {
             assert_eq!(rx.transfer_id, 2);
             assert_eq!(rx.ts, 40);
@@ -778,7 +782,7 @@ mod test {
             _ => None,
         }
         .unwrap();
-        let rx_res = uav.handle_rx_frame(0, &can_id, &frame, 50);
+        let rx_res = uav.handle_rx_frame(0, &can_id, &frame, &50);
         if let Ok(Some(_rx)) = rx_res {
             assert!(false);
         };
@@ -788,7 +792,7 @@ mod test {
             _ => None,
         }
         .unwrap();
-        let rx_res = uav.handle_rx_frame(0, &can_id, &frame, 55);
+        let rx_res = uav.handle_rx_frame(0, &can_id, &frame, &55);
         if let Ok(Some(rx)) = rx_res {
             assert_eq!(rx.transfer_id, 3);
             assert_eq!(rx.ts, 50);
@@ -801,26 +805,4 @@ mod test {
             assert!(false);
         }
     }
-
-    // #[derive(Debug)]
-    // struct FooBar {
-    //     foo: i32,
-    //     bar: i32,
-    // }
-    // impl FooBar {
-    //     fn woot(&mut self, x: i32) {
-    //         self.foo += x;
-    //         self.bar -= x
-    //     }
-    // }
-
-    // fn call(foobar: &mut FooBar, functor: fn(&mut FooBar, x: i32), v: i32) {
-    //     functor(foobar, v)
-    // }
-
-    // fn main() {
-    //     let mut foobar = FooBar { foo: 123, bar: 123 };
-    //     call(&mut foobar, FooBar::woot, 234);
-    //     println!("{:?}", foobar);
-    // }
 }

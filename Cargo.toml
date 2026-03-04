@@ -13,7 +13,7 @@ heapless = "0.8.0"
 log = "0.4.21"
 nb = "1"
 # for f16 implementation
-half = "2.7.1"
+half = { version = "2.7.1", default-features = false }
 
 # For the tightly-packed and many-fielded Fix2.
 packed_struct = {version = "^0.10.1", default-features = false }

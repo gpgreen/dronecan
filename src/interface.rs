@@ -1,10 +1,10 @@
 //! This module contains code related to sending and receiving DroneCAN frames over CAN.
 
 use crate::{
+    CanError,
     crc::TransferCrc,
     messages::MsgType,
     protocol::{CanId, FrameType, RequestResponse, TailByte, TransferComponent},
-    CanError,
 };
 use bitvec::prelude::*;
 use embedded_can;
@@ -17,7 +17,7 @@ pub(crate) const MAX_RX_FRAMES_LEGACY: usize = 24;
 pub(crate) const RX_TX_BUFFER_MAX_SIZE: usize = MAX_RX_FRAMES_LEGACY * DATA_FRAME_MAX_LEN_LEGACY;
 
 /// The key for a map entry to `TransferDesc`
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum TransferDescKey {
     /// datatype, source_id
@@ -41,7 +41,7 @@ impl TransferDescKey {
 }
 
 /// The `TransferDesc` contains state for a given transfer
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TransferDesc {
     transfer_id: u8,
@@ -60,11 +60,7 @@ impl TransferDesc {
         if a > MAX_VALUE || b > MAX_VALUE {
             panic!();
         }
-        if a > b {
-            MAX_VALUE - a + b + 1
-        } else {
-            b - a
-        }
+        if a > b { MAX_VALUE - a + b + 1 } else { b - a }
     }
 
     /// Get the transfer_id
@@ -84,7 +80,7 @@ impl TransferDesc {
 }
 
 /// The `RxPayload` contains state for a completed transfer
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct RxPayload {
     /// Transfer number for this payload
@@ -498,7 +494,7 @@ where
 mod test {
     use super::*;
     use core::convert::Infallible;
-    use embedded_can::{nb::Can, ExtendedId, Frame, Id};
+    use embedded_can::{ExtendedId, Frame, Id, nb::Can};
     use test_log::test;
 
     /// MockFrame

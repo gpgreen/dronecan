@@ -45,7 +45,7 @@ pub fn random_u32() -> u32 {
 }
 
 /// Errors that can occur in dronecan
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone)]
 pub enum CanError<E: embedded_can::Error + core::fmt::Debug> {
     Hardware(E),

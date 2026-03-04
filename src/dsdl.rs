@@ -7,14 +7,14 @@ use half::f16;
 use heapless::{String, Vec};
 
 #[cfg(feature = "defmt")]
-use defmt::*;
+use defmt::panic;
 //#[cfg(not(feature = "defmt"))]
 //use log::*;
 
 ////////////////////////////////////////////////////////////////////////////////
 
 /// Reference: https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/341.NodeStatus.uavcan
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum NodeHealth {
@@ -39,7 +39,7 @@ impl From<u8> for NodeHealth {
 ////////////////////////////////////////////////////////////////////////////////
 
 /// Reference: https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/341.NodeStatus.uavcan
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum NodeMode {
@@ -69,7 +69,7 @@ impl From<u8> for NodeMode {
 pub const PAYLOAD_SIZE_NODE_STATUS: usize = 7;
 
 /// Broadcast periodically, and sent as part of the Node Status message.
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeStatus {
     pub uptime_sec: u32,
@@ -117,7 +117,7 @@ pub const HARDWARE_VERSION_MAX_SIZE: usize = 19 + 255;
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/HardwareVersion.uavcan
 /// Generic hardware version information.
 /// These values should remain unchanged for the device's lifetime.
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HardwareVersion {
     pub major: u8,
@@ -199,7 +199,6 @@ pub const PAYLOAD_SIZE_SOFTWARE_VERSION: usize = 15;
 
 bitflags! {
     /// Optional field flags in `SoftwareVersion`
-    #[cfg_attr(feature = "defmt", derive(Format))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct FieldFlags: u8 {
         /// The value `VCS_COMMIT` at bit position `0`
@@ -209,9 +208,17 @@ bitflags! {
     }
 }
 
+#[cfg(feature = "defmt")]
+impl defmt::Format for FieldFlags {
+    fn format(&self, fmt: defmt::Formatter) {
+        // Format as hexadecimal.
+        defmt::write!(fmt, "FieldFlags({=u8:x})", self.bits());
+    }
+}
+
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/SoftwareVersion.uavcan
 /// Generic software version information.
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct SoftwareVersion {
     pub major: u8,
@@ -288,7 +295,7 @@ pub const UAVCAN_PROTOCOL_GET_NODE_INFO_RESPONSE_MAX_SIZE: usize = 377;
 ///
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/GetNodeInfoResponse.uavcan
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct GetNodeInfoResponse {
     pub node_status: NodeStatus,
     pub sw_version: SoftwareVersion,
@@ -362,7 +369,7 @@ pub const UAVCAN_PROTOCOL_EXECUTEOPCODE_REQUEST_SIZE: usize = 7;
 pub const UAVCAN_PROTOCOL_EXECUTEOPCODE_RESPONSE_SIZE: usize = 7;
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/param/10.ExecuteOpcode.uavcan
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum OpcodeType {
@@ -372,7 +379,7 @@ pub enum OpcodeType {
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/param/10.ExecuteOpcode.uavcan
 /// Pertains to saving or erasing config to/from flash
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecuteOpcodeRequest {
     pub opcode: OpcodeType,
@@ -420,7 +427,7 @@ impl ExecuteOpcodeRequest {
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/param/10.ExecuteOpcode.uavcan
 /// Pertains to saving or erasing config to/from flash
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecuteOpcodeResponse {
     pub error_code: Option<i64>, // 48 bits.
@@ -473,7 +480,7 @@ pub const VALUE_NUMERIC_TAG_BIT_LEN: usize = 2;
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/param/NumericValue.uavcan
 /// `uavcan.protocol.param.NumericValue`
 /// 2-bit tag with 6-bit prefix for alignment
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NumericValue {
     Empty,
@@ -552,7 +559,7 @@ pub const VALUE_TAG_BIT_LEN: usize = 3;
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/param/Value.uavcan
 /// `uavcan.protocol.param.Value`
 /// 3-bit tag with 5-bit prefix for alignment.
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Empty,
@@ -673,7 +680,7 @@ impl Value {
 pub const UAVCAN_PROTOCOL_GETSET_REQUEST_MAX_SIZE: usize = 224;
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/param/11.GetSet.uavcan
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct GetSetRequest {
     pub index: u16, // 13 bits
@@ -730,7 +737,7 @@ impl GetSetRequest {
 pub const UAVCAN_PROTOCOL_GETSET_RESPONSE_MAX_SIZE: usize = 371;
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/param/11.GetSet.uavcan
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct GetSetResponse {
     /// For set requests, it should contain the actual parameter value after the set request was
@@ -795,7 +802,7 @@ impl GetSetResponse {
 ////////////////////////////////////////////////////////////////////////////////
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/DataTypeKind.uavcan
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum DataTypeKind {
@@ -806,7 +813,7 @@ pub enum DataTypeKind {
 pub const UAVCAN_PROTOCOL_GETDATATYPEINFO_REQUEST_MAX_SIZE: usize = 84;
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/2.GetDataTypeInfo.uavcan
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct GetDataTypeInfoRequest {
     pub id: u16,
@@ -859,7 +866,6 @@ pub const UAVCAN_PROTOCOL_GETDATATYPEINFO_SIGNATURE: u64 = 0x1B283338A7BED2D8;
 
 bitflags! {
     /// Data Type Info flags in `GetDataTypeInfoResponse`
-    #[cfg_attr(feature = "defmt", derive(Format))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct DataTypeFlags: u8 {
         /// The value `KNOWN` at bit position `0`
@@ -873,8 +879,16 @@ bitflags! {
     }
 }
 
+#[cfg(feature = "defmt")]
+impl defmt::Format for DataTypeFlags {
+    fn format(&self, fmt: defmt::Formatter) {
+        // Format as hexadecimal.
+        defmt::write!(fmt, "DataTypeFlags({=u8:x})", self.bits());
+    }
+}
+
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/protocol/2.GetDataTypeInfo.uavcan
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct GetDataTypeInfoResponse {
     /// UAVCAN signature of the Data Type
@@ -1000,7 +1014,7 @@ pub const UAVCAN_EQUIPMENT_AHRS_SOLUTION_COVARIANCE_MAX_SIZE: usize = 9;
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/ahrs/1000.Solution.uavcan
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Covariance {
     pub data: Vec<f32, UAVCAN_EQUIPMENT_AHRS_SOLUTION_COVARIANCE_MAX_SIZE>,
 }
@@ -1018,7 +1032,7 @@ pub const UAVCAN_EQUIPMENT_AHRS_SOLUTION_MAX_SIZE: usize = 84;
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/ahrs/1000.Solution.uavcan
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct AhrsSolution {
     pub uavcan_timestamp: u64,
     pub orientation_xyzw: [f32; 4],
@@ -1235,7 +1249,7 @@ pub const UAVCAN_EQUIPMENT_AHRS_MAGNETIC_FIELD_STRENGTH2_MAX_SIZE: usize = 26;
 ///
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/ahrs/MagneticFieldStrength2.uavcan
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct MagneticFieldStrength2 {
     pub sensor_id: u8,
     pub magnetic_field_ga: [f32; 3],
@@ -1340,7 +1354,7 @@ pub const UAVCAN_EQUIPMENT_INDICATION_RGB565_MAX_SIZE: usize = 2;
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/indication/RGB565.uavcan
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Rgb565 {
     pub red: u8,
     pub green: u8,
@@ -1371,7 +1385,7 @@ impl Rgb565 {
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/indication/SingleLightCommand.uavcan
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[repr(u8)]
 pub enum LightId {
     Other(u8),
@@ -1430,7 +1444,7 @@ pub const UAVCAN_EQUIPMENT_INDICATION_SINGLELIGHTCOMMAND_SIZE: usize = 3;
 
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/indication/SingleLightCommand.uavcan
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct SingleLightCommand {
     pub light_id: LightId,
     pub color: Rgb565,
@@ -1463,7 +1477,7 @@ pub const UAVCAN_EQUIPMENT_INDICATION_LIGHTSCOMMAND_MAX_SIZE: usize =
 ///
 /// https://github.com/dronecan/DSDL/blob/master/uavcan/equipment/indication/LightsCommand.uavcan
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct LightsCommand {
     pub data: Vec<SingleLightCommand, 20>,
 }

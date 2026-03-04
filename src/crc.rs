@@ -4,7 +4,7 @@ const CRC_POLY: u16 = 0x1021;
 
 /// Code for computing CRC for multi-frame transfers:
 /// Adapted from https://dronecan.github.io/Specification/4._CAN_bus_transport_layer/
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct TransferCrc {
     pub value: u16,

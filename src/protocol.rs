@@ -6,7 +6,7 @@ pub const NODE_ID_MAX_VALUE: u8 = 127;
 
 /// This includes configuration data that we use on all nodes, and is not part of the official
 /// DroneCAN spec.
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ConfigCommon {
     /// Used to distinguish between multiple instances of this device. Stored in
     /// flash. If dyanmic id allocation is enabled, this is overwritten, but passed as
@@ -61,7 +61,7 @@ impl ConfigCommon {
 
 /// Distinguish single and multi-part transfers. The inner value is the toggle value of the
 /// previous frame.
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy)]
 pub enum TransferComponent {
     SingleFrame,
@@ -81,7 +81,7 @@ pub enum TransferComponent {
 /// In multi-frame transfers, the value of the priority field shall be identical for all frames of the transfer.
 ///
 /// We use the Cyphal specification, due to its specificity.
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MsgPriority {
     Exceptional,
@@ -125,7 +125,7 @@ impl MsgPriority {
 }
 
 /// Differentiates between messages and services
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum FrameType {
     Message,
@@ -134,14 +134,14 @@ pub enum FrameType {
 }
 
 /// Data present in services, but not messages.
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub struct ServiceData {
     pub dest_node_id: u8, // 7 bits
     pub req_or_resp: RequestResponse,
 }
 
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Copy, Clone)]
 pub struct TailByte {
     pub start_of_transfer: bool,
@@ -209,7 +209,7 @@ impl TailByte {
     }
 }
 
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum RequestResponse {
@@ -228,7 +228,7 @@ pub enum RequestResponse {
 /// - Message type ID: Data type ID of the encoded message (16 bits)
 /// - Service not message: Always 0. 1 bit.
 /// - Source node ID.Can be 1-27. 7 bits.
-#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct CanId {
     // Valid values for priority range from 0 to 31, inclusively, where 0 corresponds to highest

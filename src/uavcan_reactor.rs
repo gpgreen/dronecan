@@ -11,10 +11,31 @@ use defmt::*;
 use embedded_can;
 use heapless::{Vec, index_map::FnvIndexMap};
 
+/// Type to represent a Uavcan message
+/// for broadcasting. A return value in `UavcanHandler`
+/// which is used in Uavcan::broadcast to convert to
+/// CAN frames
+#[derive(Debug, Clone)]
+pub struct BroadcastMessage<const BROADCAST_PAYLOAD_SIZE_MAX: usize = 72> {
+    pub frame_type: FrameType,
+    pub msg_type: MsgType,
+    pub payload: Vec<u8, BROADCAST_PAYLOAD_SIZE_MAX>,
+}
+
+impl<const BROADCAST_PAYLOAD_SIZE_MAX: usize> BroadcastMessage<BROADCAST_PAYLOAD_SIZE_MAX> {
+    pub fn new(frame_type: FrameType, msg_type: MsgType) -> Self {
+        BroadcastMessage {
+            frame_type,
+            msg_type,
+            payload: Vec::new(),
+        }
+    }
+}
+
 /// Trait for application specific frame handler
 /// This allows different handlers for different Uavcan frame types
 /// The main categories of frame types, are Services, Messages, and Anonymous Messages
-pub trait UavcanHandler<CAN, FRAME, E>
+pub trait UavcanHandler<CAN, FRAME, E, const BROADCAST_PAYLOAD_SIZE_MAX: usize>
 where
     CAN: embedded_can::nb::Can<Frame = FRAME, Error = E>,
     FRAME: embedded_can::Frame,
@@ -27,12 +48,12 @@ where
         payload: &RxPayload,
         can_id: &CanId,
         interface: &mut UavcanInterface<CAN>,
-    ) -> Result<Option<Vec<FRAME, 10>>, CanError<E>>;
+    ) -> Result<Vec<BroadcastMessage<BROADCAST_PAYLOAD_SIZE_MAX>, 10>, CanError<E>>;
 }
 
 /// Uavcan This type allows handling of received CAN frames for the
-/// dronecode CAN stack.  To send CAN frames, use the
-/// `UavcanInterface` which is part of this type
+/// dronecode CAN stack. This type will also assemble CAN frames to send
+/// using broadcast. To send or receive CAN frames, use `UavcanInterface`
 ///
 /// TXQUEUELEN is the maximum size of the transmit queue for CAN
 /// frames. This should be sized for the number of frames that the
@@ -41,8 +62,7 @@ where
 /// for this application. (power of 2 size)
 pub struct Uavcan<const TXQUEUELEN: usize = 10, const TXFMAPLEN: usize = 16> {
     node_id: u8,
-    //    tx_queue: Deque<FRAME, TXQUEUELEN>,
-    txf_map: FnvIndexMap<TransferDescKey, TransferDesc, TXFMAPLEN>, // size must be power of 2
+    txf_map: FnvIndexMap<TransferDescKey, TransferDesc, TXFMAPLEN>,
     initialized: bool,
     transfer_timeout: u64,
     interface_switch_delay: u64,
@@ -53,7 +73,6 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
     pub fn new(node_id: u8, transfer_timeout: u64, interface_switch_delay: u64) -> Self {
         Self {
             node_id,
-            //            tx_queue: Deque::new(),
             txf_map: FnvIndexMap::new(),
             initialized: false,
             transfer_timeout,
@@ -93,23 +112,23 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
     /// handler.  If the frame is not a data frame, or doesn't have an
     /// extended id, it is ignored. If the frame is a service request
     /// or response for different node id, it is ignored.
-    pub fn handle_rx_frame<CAN, FRAME, E, FH>(
+    pub fn handle_rx_frame<CAN, FRAME, E, FH, const BROADCAST_PAYLOAD_SIZE_MAX: usize>(
         &mut self,
         iface: &mut UavcanInterface<CAN>,
         frame: &FRAME,
         ts: &u64,
         handler: Option<&FH>,
-    ) -> Result<(), CanError<E>>
+    ) -> Result<Option<Vec<BroadcastMessage<BROADCAST_PAYLOAD_SIZE_MAX>, 10>>, CanError<E>>
     where
         CAN: embedded_can::nb::Can<Frame = FRAME, Error = E>,
         FRAME: embedded_can::Frame,
         E: embedded_can::Error,
-        FH: UavcanHandler<CAN, FRAME, E>,
+        FH: UavcanHandler<CAN, FRAME, E, BROADCAST_PAYLOAD_SIZE_MAX>,
     {
         // get the CanId, ignore non-extended CAN id's
         let can_id = match frame.id() {
             embedded_can::Id::Extended(eid) => CanId::from_value(eid.as_raw()),
-            _ => return Ok(()),
+            _ => return Ok(None),
         };
         #[cfg(feature = "defmt")]
         debug!(
@@ -124,20 +143,21 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
                 if service_data.dest_node_id != self.node_id {
                     #[cfg(feature = "defmt")]
                     debug!("service request/response is not for this node");
-                    return Ok(());
+                    return Ok(None);
                 }
             }
             // otherwise, process the data frame
             if let Some(rx_payload) = self._handle_rx_frame(iface, &can_id, frame, ts)? {
                 // got a completed transfer, pass to handler
                 if let Some(handler) = handler {
-                    handler.handle_message(self.node_id, &rx_payload, &can_id, iface)?;
+                    let msgs = handler.handle_message(self.node_id, &rx_payload, &can_id, iface)?;
+                    return Ok(Some(msgs));
                 }
             }
         }
         #[cfg(feature = "defmt")]
         debug!("<== rx_frame {:x?}", can_id.type_id);
-        Ok(())
+        Ok(None)
     }
 
     /// Queue a DroneCAN "broadcast" message.
@@ -145,11 +165,13 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
     /// See [The DroneCAN spec, transport layer page](https://dronecan.github.io/Specification/4._CAN_bus_transport_layer/)
     /// When done, a series of CAN frames will be in the transmit queue, ready to be sent via the CAN controller
     /// Should be broadcast at interval between 2 and 1000ms.
-    pub fn broadcast<FRAME: embedded_can::Frame, E: embedded_can::Error>(
+    pub fn broadcast<
+        FRAME: embedded_can::Frame,
+        E: embedded_can::Error,
+        const BROADCAST_PAYLOAD_SIZE_MAX: usize,
+    >(
         &mut self,
-        frame_type: FrameType,
-        msg_type: MsgType,
-        payload: &[u8],
+        msg: BroadcastMessage<BROADCAST_PAYLOAD_SIZE_MAX>,
     ) -> Result<Vec<FRAME, 10>, CanError<E>> {
         #[cfg(feature = "defmt")]
         debug!(
@@ -161,7 +183,7 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
         );
 
         // get the transfer descriptor
-        let txf_key = TransferDescKey::new(frame_type, msg_type.id(), self.node_id);
+        let txf_key = TransferDescKey::new(msg.frame_type, msg.msg_type.id(), self.node_id);
         #[cfg(feature = "defmt")]
         trace!("txf_key:{:?}", txf_key);
         if !self.txf_map.contains_key(&txf_key) {
@@ -179,7 +201,7 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
 
         // if this is a service reply, use the existing transfer id, otherwise, increment and
         // use that.
-        let transfer_id = match frame_type {
+        let transfer_id = match msg.frame_type {
             FrameType::Service(s) if s.req_or_resp == RequestResponse::Response => {
                 txf_desc.transfer_id()
             }
@@ -189,25 +211,25 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
         trace!("descriptor updated state:{:?}", txf_desc);
 
         let can_id = CanId {
-            priority: msg_type.priority(),
-            type_id: msg_type.id(),
+            priority: msg.msg_type.priority(),
+            type_id: msg.msg_type.id(),
             source_node_id: self.node_id,
-            frame_type,
+            frame_type: msg.frame_type,
         };
         #[cfg(feature = "defmt")]
         trace!("can id: {:?}", can_id);
 
         // The transfer payload is up to 7 bytes for non-FD DRONECAN.
         // If data is longer than a single frame, set up a multi-frame transfer.
-        if payload.len() >= DATA_FRAME_MAX_LEN_LEGACY {
+        if msg.payload.len() >= DATA_FRAME_MAX_LEN_LEGACY {
             #[cfg(feature = "defmt")]
             trace!("multiple frames payload");
             self.queue_multiple_frames::<FRAME, E>(
                 txf_key,
-                payload,
+                msg.payload.as_slice(),
                 can_id.value(),
                 transfer_id,
-                msg_type.base_crc(),
+                msg.msg_type.base_crc(),
             )
         } else {
             #[cfg(feature = "defmt")]
@@ -215,7 +237,7 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
             // copy the data
             txf_desc
                 .payload
-                .extend_from_slice(payload)
+                .extend_from_slice(msg.payload.as_slice())
                 .map_err(|_| CanError::TxPayloadBufferFull)?;
             let tail_byte = TailByte::new(TransferComponent::SingleFrame, transfer_id);
             #[cfg(feature = "defmt")]
@@ -616,18 +638,19 @@ mod test {
         }
     }
 
-    impl UavcanHandler<MockCan, MockFrame, Infallible> for MockHandler {
+    impl UavcanHandler<MockCan, MockFrame, Infallible, 72> for MockHandler {
         fn handle_message(
             &self,
             _node_id: u8,
             payload: &RxPayload,
             _can_id: &CanId,
             _interface: &mut UavcanInterface<MockCan>,
-        ) -> Result<Option<Vec<MockFrame, 10>>, CanError<Infallible>> {
+        ) -> Result<Vec<BroadcastMessage, 10>, CanError<Infallible>> {
             let idx = *self.index.borrow();
             assert_eq!(*payload, self.expected[idx]);
             self.index.replace(idx + 1);
-            Ok(None)
+            let retvec = Vec::new();
+            Ok(retvec)
         }
     }
 
@@ -649,16 +672,14 @@ mod test {
         let mut uav: Uavcan = Uavcan::new(1, 2000, 300);
 
         // now send 2 frames each a message of 7 bytes
-        let frame_type = FrameType::Message;
-        let msg_type = MsgType::NodeStatus;
         let payload = [0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7];
-        let tx_frames = uav
-            .broadcast::<MockFrame, Infallible>(frame_type, msg_type, &payload)
-            .unwrap();
+        let mut msg1 = BroadcastMessage::new(FrameType::Message, MsgType::NodeStatus);
+        msg1.payload.extend_from_slice(&payload).unwrap();
+        let tx_frames = uav.broadcast::<MockFrame, Infallible, 72>(msg1).unwrap();
         intf.send(tx_frames).unwrap();
-        let tx_frames = uav
-            .broadcast::<MockFrame, Infallible>(frame_type, msg_type, &payload)
-            .unwrap();
+        let mut msg2 = BroadcastMessage::new(FrameType::Message, MsgType::NodeStatus);
+        msg2.payload.extend_from_slice(&payload).unwrap();
+        let tx_frames = uav.broadcast::<MockFrame, Infallible, 72>(msg2).unwrap();
         intf.send(tx_frames).unwrap();
     }
 
@@ -688,16 +709,14 @@ mod test {
         let mut uav: Uavcan = Uavcan::new(1, 2000, 300);
 
         // now send 4 frames, consisting of 2 messages of 8 bytes
-        let frame_type = FrameType::Message;
-        let msg_type = MsgType::NodeStatus;
         let payload = [0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8];
-        let tx_frames = uav
-            .broadcast::<MockFrame, Infallible>(frame_type, msg_type, &payload)
-            .unwrap();
+        let mut msg1 = BroadcastMessage::new(FrameType::Message, MsgType::NodeStatus);
+        msg1.payload.extend_from_slice(&payload).unwrap();
+        let tx_frames = uav.broadcast::<MockFrame, Infallible, 72>(msg1).unwrap();
         intf.send(tx_frames).unwrap();
-        let tx_frames = uav
-            .broadcast::<MockFrame, Infallible>(frame_type, msg_type, &payload)
-            .unwrap();
+        let mut msg2 = BroadcastMessage::new(FrameType::Message, MsgType::NodeStatus);
+        msg2.payload.extend_from_slice(&payload).unwrap();
+        let tx_frames = uav.broadcast::<MockFrame, Infallible, 72>(msg2).unwrap();
         intf.send(tx_frames).unwrap();
     }
 

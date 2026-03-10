@@ -1,6 +1,6 @@
 //! This module contains types associated with specific Dronecan messages.
 
-use crate::MsgType;
+use crate::{CanError, MsgType};
 use bitflags::bitflags;
 use bitvec::prelude::*;
 use half::f16;
@@ -151,7 +151,6 @@ impl HardwareVersion {
         buf[0] = self.major;
         buf[1] = self.minor;
         buf[2..18].clone_from_slice(&self.unique_id);
-        // The final index is our 8-bit length field for COA, which we hard-set to 0.
         if let Some(coa) = &self.certificate_of_authority {
             buf[18] = coa.len() as u8;
             buf[19..19 + coa.len()].copy_from_slice(coa.as_slice());
@@ -163,24 +162,26 @@ impl HardwareVersion {
         buf
     }
     /// construct `HardwareVersion` from buffer
-    pub fn from_bytes(buf: &[u8]) -> Self {
+    pub fn from_bytes<E: embedded_can::Error + core::fmt::Debug>(
+        buf: &[u8],
+    ) -> Result<Self, CanError<E>> {
         let mut unique_id = [0; 16];
         unique_id.copy_from_slice(&buf[2..18]);
         let coa_len = buf[18];
         let coa = if coa_len > 0 {
             let mut v: Vec<u8, 255> = Vec::new();
             v.extend_from_slice(&buf[19..19 + coa_len as usize])
-                .unwrap();
+                .map_err(|_e| CanError::ParseOverflow)?;
             Some(v)
         } else {
             None
         };
-        Self {
+        Ok(Self {
             major: buf[0],
             minor: buf[1],
             unique_id,
             certificate_of_authority: coa,
-        }
+        })
     }
     /// the size of the type in a buffer
     pub fn buffer_size(&self) -> usize {
@@ -312,8 +313,9 @@ impl GetNodeInfoResponse {
     /// serialize `GetNodeInfoResponse` to buffer
     pub fn to_bytes(&self) -> Vec<u8, UAVCAN_PROTOCOL_GET_NODE_INFO_RESPONSE_MAX_SIZE> {
         let mut buf = Vec::new();
-        buf.resize_default(UAVCAN_PROTOCOL_GET_NODE_INFO_RESPONSE_MAX_SIZE)
-            .unwrap();
+        // this can't fail as we are resizing to the max size of the vector
+        let _ = buf.resize_default(UAVCAN_PROTOCOL_GET_NODE_INFO_RESPONSE_MAX_SIZE);
+
         // copy node status
         let ns = self.node_status.to_bytes();
         buf[0..ns.len()].clone_from_slice(&ns);
@@ -339,26 +341,29 @@ impl GetNodeInfoResponse {
     }
 
     /// construct `GetNodeInfoResponse` from buffer
-    pub fn from_bytes(buf: &[u8]) -> Self {
+    pub fn from_bytes<E: embedded_can::Error + core::fmt::Debug>(
+        buf: &[u8],
+    ) -> Result<Self, CanError<E>> {
         let mut start = 0;
         let node_status = NodeStatus::from_bytes(&buf[start..PAYLOAD_SIZE_NODE_STATUS]);
         start = PAYLOAD_SIZE_NODE_STATUS;
         let sw_version =
             SoftwareVersion::from_bytes(&buf[start..start + PAYLOAD_SIZE_SOFTWARE_VERSION]);
         start += PAYLOAD_SIZE_SOFTWARE_VERSION;
-        let hw_version = HardwareVersion::from_bytes(&buf[start..]);
+        let hw_version = HardwareVersion::from_bytes(&buf[start..])?;
         start += hw_version.buffer_size();
         let name_len = buf[start];
         start += 1;
         let mut v = Vec::new();
-        let _ = v.extend_from_slice(&buf[start..start + name_len as usize]);
-        let name = String::from_utf8(v).unwrap();
-        Self {
+        v.extend_from_slice(&buf[start..start + name_len as usize])
+            .map_err(|_| CanError::ParseOverflow)?;
+        let name = String::from_utf8(v).map_err(|_| CanError::Utf8Decoding)?;
+        Ok(Self {
             node_status,
             sw_version,
             hw_version,
             name,
-        }
+        })
     }
 }
 
@@ -396,7 +401,7 @@ impl ExecuteOpcodeRequest {
         })
         .ok();
         buf.extend_from_slice(&self.argument.to_le_bytes()[..6])
-            .unwrap();
+            .expect("ExecuteOpcodeRequest serialize buffer too short");
         buf
     }
 
@@ -439,7 +444,8 @@ impl ExecuteOpcodeResponse {
     pub fn to_bytes(&self) -> Vec<u8, UAVCAN_PROTOCOL_EXECUTEOPCODE_RESPONSE_SIZE> {
         let mut buf = Vec::new();
         let val = self.error_code.unwrap_or(0);
-        buf.extend_from_slice(&val.to_le_bytes()[..6]).unwrap();
+        buf.extend_from_slice(&val.to_le_bytes()[..6])
+            .expect("ExecuteOpcodeResponse serialize buffer too short");
         let val = match self.ok {
             true => 1,
             false => 0,
@@ -560,20 +566,15 @@ pub const VALUE_TAG_BIT_LEN: usize = 3;
 /// `uavcan.protocol.param.Value`
 /// 3-bit tag with 5-bit prefix for alignment.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum Value {
+    #[default]
     Empty,
     Integer(i64),
     Real(f32),
     Boolean(bool), // u8 repr
     /// Max length of 128 bytes.
     String(heapless::String<128>),
-}
-
-impl Default for Value {
-    fn default() -> Self {
-        Self::Empty
-    }
 }
 
 impl Value {
@@ -695,8 +696,8 @@ impl GetSetRequest {
     /// serialize `GetSetRequest` to buffer
     pub fn to_bytes(&self) -> Vec<u8, UAVCAN_PROTOCOL_GETSET_REQUEST_MAX_SIZE> {
         let mut buf = Vec::new();
-        buf.resize_default(UAVCAN_PROTOCOL_GETSET_REQUEST_MAX_SIZE)
-            .unwrap();
+        // this can't fail as we resize the vector to it's max capacity
+        let _ = buf.resize_default(UAVCAN_PROTOCOL_GETSET_REQUEST_MAX_SIZE);
         let bits = buf.view_bits_mut::<Lsb0>();
         bits[0..13].store_le(self.index);
         let current_offset = self.value.to_bits(bits, 13);
@@ -755,8 +756,8 @@ impl GetSetResponse {
     /// serialize `GetSetResponse` to buffer
     pub fn to_bytes(&self) -> Vec<u8, UAVCAN_PROTOCOL_GETSET_RESPONSE_MAX_SIZE> {
         let mut buf = Vec::new();
-        buf.resize_default(UAVCAN_PROTOCOL_GETSET_RESPONSE_MAX_SIZE)
-            .unwrap();
+        // this can't fail as we resize vec to it's max capacity
+        let _ = buf.resize_default(UAVCAN_PROTOCOL_GETSET_RESPONSE_MAX_SIZE);
         let bits = buf.view_bits_mut::<Lsb0>();
         let bit_offset = self.value.to_bits(bits, 5);
         let bit_offset = self.default_value.to_bits(bits, bit_offset + 5);
@@ -825,7 +826,8 @@ impl GetDataTypeInfoRequest {
     /// serialize `GetDataTypeInfoRequest` to buffer
     pub fn to_bytes(&self) -> Vec<u8, UAVCAN_PROTOCOL_GETDATATYPEINFO_REQUEST_MAX_SIZE> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(&self.id.to_le_bytes()).unwrap();
+        buf.extend_from_slice(&self.id.to_le_bytes())
+            .expect("GetDataTypeInfoRequest serialize buffer too short");
         let kb = if self.kind == DataTypeKind::Service {
             0
         } else {
@@ -834,7 +836,8 @@ impl GetDataTypeInfoRequest {
         buf.push(kb).unwrap();
         let name_vec = self.name.clone();
         let name_buf = name_vec.as_bytes();
-        buf.extend_from_slice(name_buf).unwrap();
+        buf.extend_from_slice(name_buf)
+            .expect("GetDataTypeInfoRequest serialize buffer too short");
         buf
     }
 
@@ -908,8 +911,9 @@ impl GetDataTypeInfoResponse {
     pub fn to_bytes(&self) -> Vec<u8, UAVCAN_PROTOCOL_GETDATATYPEINFO_REQUEST_MAX_SIZE> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&self.signature.to_le_bytes())
-            .unwrap();
-        buf.extend_from_slice(&self.id.to_le_bytes()).unwrap();
+            .expect("GetDataTypeInfoResponse serialize buffer too short@signature");
+        buf.extend_from_slice(&self.id.to_le_bytes())
+            .expect("GetDataTypeInfoResponse serialize buffer too short@id");
         let kb = if self.kind == DataTypeKind::Service {
             0
         } else {
@@ -919,12 +923,15 @@ impl GetDataTypeInfoResponse {
         buf.push(self.flags.bits()).unwrap();
         let name_vec = self.name.clone();
         let name_buf = name_vec.as_bytes();
-        buf.extend_from_slice(name_buf).unwrap();
+        buf.extend_from_slice(name_buf)
+            .expect("GetDataTypeInfoResponse serialize buffer too short @name");
         buf
     }
 
     /// construct `GetDataTypeInfoResponse` from buffer
-    pub fn from_bytes(buf: &[u8]) -> Self {
+    pub fn from_bytes<E: embedded_can::Error + core::fmt::Debug>(
+        buf: &[u8],
+    ) -> Result<Self, CanError<E>> {
         let bits = buf.view_bits::<Lsb0>();
         let signature = bits[0..64].load_le();
         let id = bits[64..80].load_le();
@@ -935,16 +942,17 @@ impl GetDataTypeInfoResponse {
         };
         let flags = DataTypeFlags::from_bits_truncate(buf[11]);
         let mut v = Vec::new();
-        v.extend_from_slice(&buf[12..]).unwrap();
-        let name = String::from_utf8(v).unwrap();
+        v.extend_from_slice(&buf[12..])
+            .map_err(|_| CanError::ParseOverflow)?;
+        let name = String::from_utf8(v).map_err(|_| CanError::Utf8Decoding)?;
 
-        Self {
+        Ok(Self {
             signature,
             id,
             kind,
             flags,
             name,
-        }
+        })
     }
 }
 
@@ -1260,8 +1268,8 @@ impl MagneticFieldStrength2 {
     /// serialize `MagneticFieldStrength2` to buffer
     pub fn to_bytes(&self) -> Vec<u8, UAVCAN_EQUIPMENT_AHRS_MAGNETIC_FIELD_STRENGTH2_MAX_SIZE> {
         let mut buf = Vec::new();
-        buf.resize_default(UAVCAN_EQUIPMENT_AHRS_MAGNETIC_FIELD_STRENGTH2_MAX_SIZE)
-            .unwrap();
+        // can't fail as we resize vec to max capacity
+        let _ = buf.resize_default(UAVCAN_EQUIPMENT_AHRS_MAGNETIC_FIELD_STRENGTH2_MAX_SIZE);
         // copy sensor id
         buf[0] = self.sensor_id;
 
@@ -1487,19 +1495,22 @@ impl LightsCommand {
     pub fn to_bytes(&self) -> Vec<u8, UAVCAN_EQUIPMENT_INDICATION_LIGHTSCOMMAND_MAX_SIZE> {
         let mut buf = Vec::new();
         for cmd in self.data.iter() {
-            buf.extend_from_slice(&cmd.to_bytes()).ok();
+            buf.extend_from_slice(&cmd.to_bytes())
+                .expect("LightsCommand Single command overflowed serialize buffer");
         }
         buf
     }
 
     /// construct `LightsCommand` from buffer
-    pub fn from_bytes(buf: &[u8]) -> Self {
+    pub fn from_bytes<E: embedded_can::Error + core::fmt::Debug>(
+        buf: &[u8],
+    ) -> Result<Self, CanError<E>> {
         let mut data = Vec::new();
         for buf in buf.chunks(UAVCAN_EQUIPMENT_INDICATION_SINGLELIGHTCOMMAND_SIZE) {
             let cmd = SingleLightCommand::from_bytes(buf);
-            data.push(cmd).ok();
+            data.push(cmd).map_err(|_| CanError::ParseOverflow)?;
         }
-        Self { data }
+        Ok(Self { data })
     }
 }
 
@@ -1508,6 +1519,7 @@ impl LightsCommand {
 #[cfg(test)]
 mod test {
     use super::*;
+    use core::convert::Infallible;
     use test_log::test;
 
     #[test]
@@ -1575,7 +1587,7 @@ mod test {
             certificate_of_authority: None,
         };
         let buf1 = hw1.to_bytes();
-        let hw2 = HardwareVersion::from_bytes(&buf1);
+        let hw2 = HardwareVersion::from_bytes::<Infallible>(&buf1).unwrap();
         assert_eq!(hw1, hw2);
         let mut coa = Vec::new();
         let _ = coa.resize_default(5);
@@ -1589,7 +1601,7 @@ mod test {
             certificate_of_authority: Some(coa),
         };
         let buf1 = hw2.to_bytes();
-        let hw3 = HardwareVersion::from_bytes(&buf1);
+        let hw3 = HardwareVersion::from_bytes::<Infallible>(&buf1).unwrap();
         assert_eq!(hw2, hw3);
     }
 
@@ -1653,7 +1665,7 @@ mod test {
         let buf = cmd1.to_bytes();
         assert_eq!(buf.len(), 3);
         assert_eq!(buf[0..3], [249, 0xad, 0x55]);
-        let cmd1back = LightsCommand::from_bytes(&buf);
+        let cmd1back = LightsCommand::from_bytes::<Infallible>(&buf).unwrap();
         assert_eq!(cmd1, cmd1back);
         assert_eq!(cmd1.data[0], lc1);
     }
@@ -1925,7 +1937,7 @@ mod test {
         };
         let buf = gdt1.to_bytes();
         assert_eq!(buf.len(), 17);
-        let gdt1back = GetDataTypeInfoResponse::from_bytes(&buf);
+        let gdt1back = GetDataTypeInfoResponse::from_bytes::<Infallible>(&buf).unwrap();
         assert_eq!(gdt1, gdt1back);
     }
 }

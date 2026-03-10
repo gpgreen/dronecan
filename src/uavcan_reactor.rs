@@ -48,7 +48,7 @@ where
         payload: &RxPayload,
         can_id: &CanId,
         interface: &mut UavcanInterface<CAN>,
-    ) -> Result<Vec<BroadcastMessage<BROADCAST_PAYLOAD_SIZE_MAX>, 10>, CanError<E>>;
+    ) -> Result<Option<Vec<BroadcastMessage<BROADCAST_PAYLOAD_SIZE_MAX>, 10>>, CanError<E>>;
 }
 
 /// Uavcan This type allows handling of received CAN frames for the
@@ -151,7 +151,7 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
                 // got a completed transfer, pass to handler
                 if let Some(handler) = handler {
                     let msgs = handler.handle_message(self.node_id, &rx_payload, &can_id, iface)?;
-                    return Ok(Some(msgs));
+                    return Ok(msgs);
                 }
             }
         }
@@ -216,8 +216,11 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
             source_node_id: self.node_id,
             frame_type: msg.frame_type,
         };
+        // unwrap always works because our can_id's can't be invalid
+        let frame_id =
+            embedded_can::Id::Extended(embedded_can::ExtendedId::new(can_id.value()).unwrap());
         #[cfg(feature = "defmt")]
-        trace!("can id: {:?}", can_id);
+        trace!("can id: {:?} frame id {:?}", can_id, frame_id);
 
         // The transfer payload is up to 7 bytes for non-FD DRONECAN.
         // If data is longer than a single frame, set up a multi-frame transfer.
@@ -227,7 +230,7 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
             self.queue_multiple_frames::<FRAME, E>(
                 txf_key,
                 msg.payload.as_slice(),
-                can_id.value(),
+                frame_id,
                 transfer_id,
                 msg.msg_type.base_crc(),
             )
@@ -247,16 +250,16 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
                 .push(tail_byte.value())
                 .map_err(|_| CanError::TxPayloadBufferFull)?;
 
-            let id =
-                embedded_can::Id::Extended(embedded_can::ExtendedId::new(can_id.value()).unwrap());
             #[cfg(feature = "defmt")]
             trace!("frame can id: {:?}", id);
             // create the return vec
             let mut tx_vec = Vec::new();
 
-            tx_vec
-                .push(FRAME::new(id, txf_desc.payload.as_slice()).unwrap())
-                .map_err(|_| CanError::TransmitQueueFull)?;
+            if let Some(frame) = FRAME::new(frame_id, txf_desc.payload.as_slice()) {
+                tx_vec
+                    .push(frame)
+                    .map_err(|_| CanError::TransmitQueueFull)?;
+            }
             // reset the tx buffer
             txf_desc.payload.clear();
             Ok(tx_vec)
@@ -269,15 +272,14 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
         &mut self,
         txf_key: TransferDescKey,
         payload: &[u8],
-        can_id: u32,
+        frame_id: embedded_can::Id,
         transfer_id: u8,
         base_crc: u16,
     ) -> Result<Vec<FRAME, 10>, CanError<E>> {
         #[cfg(feature = "defmt")]
         debug!("queue multiple frames");
-        let id = embedded_can::Id::Extended(embedded_can::ExtendedId::new(can_id).unwrap());
         #[cfg(feature = "defmt")]
-        trace!("canid:{:?}", id);
+        trace!("canid:{:?}", frame_id);
 
         let txf_desc = match self.txf_map.get_mut(&txf_key) {
             Some(t) => Ok::<&mut TransferDesc, E>(t),
@@ -310,15 +312,15 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
             .payload
             .push(tail_byte.value())
             .map_err(|_| CanError::TxPayloadBufferFull)?;
-
-        let f = FRAME::new(id, &txf_desc.payload).unwrap();
         #[cfg(feature = "defmt")]
         trace!("frame queued");
 
         // create the return vector
         let mut tx_vec = Vec::new();
-        tx_vec.push(f).map_err(|_| CanError::TransmitQueueFull)?;
 
+        if let Some(f) = FRAME::new(frame_id, &txf_desc.payload) {
+            tx_vec.push(f).map_err(|_| CanError::TransmitQueueFull)?;
+        }
         let mut latest_i_sent = payload_len_this_frame - 1;
 
         // Populate subsequent frames.
@@ -350,8 +352,9 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
                 .push(tail_byte.value())
                 .map_err(|_| CanError::TxPayloadBufferFull)?;
 
-            let f = FRAME::new(id, &txf_desc.payload).unwrap();
-            tx_vec.push(f).map_err(|_| CanError::TransmitQueueFull)?;
+            if let Some(f) = FRAME::new(frame_id, &txf_desc.payload) {
+                tx_vec.push(f).map_err(|_| CanError::TransmitQueueFull)?;
+            }
 
             #[cfg(feature = "defmt")]
             trace!("next frame queued");
@@ -492,7 +495,7 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
             let rx_completed = if tail_byte.start_of_transfer {
                 payload_buffer
                     .extend_from_slice(txf_desc.payload.as_slice())
-                    .unwrap();
+                    .map_err(|_| CanError::RxPayloadBufferFull)?;
                 // single frame payload
                 RxPayload::new(txf_desc, None, payload_buffer)
             } else {
@@ -502,7 +505,7 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
                 // copy the payload, minus the CRC bytes
                 payload_buffer
                     .extend_from_slice(&txf_desc.payload.as_slice()[2..])
-                    .unwrap();
+                    .map_err(|_| CanError::RxPayloadBufferFull)?;
                 // check the crc
                 if let Some(payload_crc) = payload_crc {
                     let msg_type = MsgType::from_id(can_id.type_id)?;
@@ -645,12 +648,11 @@ mod test {
             payload: &RxPayload,
             _can_id: &CanId,
             _interface: &mut UavcanInterface<MockCan>,
-        ) -> Result<Vec<BroadcastMessage, 10>, CanError<Infallible>> {
+        ) -> Result<Option<Vec<BroadcastMessage, 10>>, CanError<Infallible>> {
             let idx = *self.index.borrow();
             assert_eq!(*payload, self.expected[idx]);
             self.index.replace(idx + 1);
-            let retvec = Vec::new();
-            Ok(retvec)
+            Ok(None)
         }
     }
 

@@ -51,6 +51,8 @@ pub enum CanError<E: embedded_can::Error + core::fmt::Debug> {
     Hardware(E),
     PayloadSize,
     PayloadData,
+    ParseOverflow,
+    Utf8Decoding,
     TransmitQueueFull,
     TransferMapFull,
     RxPayloadBufferFull,

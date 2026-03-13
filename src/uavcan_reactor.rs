@@ -11,6 +11,25 @@ use defmt::*;
 use embedded_can;
 use heapless::{Vec, index_map::FnvIndexMap};
 
+/// Wrap the type so we can use defmt
+#[cfg(feature = "defmt")]
+struct FormattedCanId(embedded_can::Id);
+
+/// Implement defmt::Format for the wrapped type
+#[cfg(feature = "defmt")]
+impl defmt::Format for FormattedCanId {
+    fn format(&self, fmt: defmt::Formatter<'_>) {
+        match self.0 {
+            embedded_can::Id::Standard(x) => {
+                defmt::write!(fmt, "StdId:{=u16:x}", x.as_raw())
+            }
+            embedded_can::Id::Extended(x) => {
+                defmt::write!(fmt, "ExtId:{=u32:x}", x.as_raw())
+            }
+        }
+    }
+}
+
 /// Type to represent a Uavcan message
 /// for broadcasting. A return value in `UavcanHandler`
 /// which is used in Uavcan::broadcast to convert to
@@ -132,7 +151,7 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
         };
         #[cfg(feature = "defmt")]
         debug!(
-            "==> rx_frame {:x?} dlc:{} data:{:x?}",
+            "==> rx_frame {:?} dlc:{} data:{:?}",
             can_id,
             frame.dlc(),
             frame.data()
@@ -156,7 +175,7 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
             }
         }
         #[cfg(feature = "defmt")]
-        debug!("<== rx_frame {:x?}", can_id.type_id);
+        debug!("<== rx_frame {:?}", can_id.type_id);
         Ok(None)
     }
 
@@ -176,10 +195,10 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
         #[cfg(feature = "defmt")]
         debug!(
             "broadcast frame:{:?} msg_type:{:?} source node:{} payload len:{}",
-            frame_type,
-            msg_type,
+            msg.frame_type,
+            msg.msg_type,
             self.node_id,
-            payload.len(),
+            msg.payload.len(),
         );
 
         // get the transfer descriptor
@@ -193,6 +212,9 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
         }
         let txf_desc = match self.txf_map.get_mut(&txf_key) {
             Some(t) => Ok::<&mut TransferDesc, E>(t),
+            #[cfg(feature = "defmt")]
+            None => defmt::panic!(),
+            #[cfg(not(feature = "defmt"))]
             None => panic!(),
         }?;
         // TODO: update descriptor with timestamp
@@ -220,7 +242,11 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
         let frame_id =
             embedded_can::Id::Extended(embedded_can::ExtendedId::new(can_id.value()).unwrap());
         #[cfg(feature = "defmt")]
-        trace!("can id: {:?} frame id {:?}", can_id, frame_id);
+        trace!(
+            "can id: {:?} frame id {:?}",
+            can_id,
+            FormattedCanId(frame_id)
+        );
 
         // The transfer payload is up to 7 bytes for non-FD DRONECAN.
         // If data is longer than a single frame, set up a multi-frame transfer.
@@ -251,7 +277,7 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
                 .map_err(|_| CanError::TxPayloadBufferFull)?;
 
             #[cfg(feature = "defmt")]
-            trace!("frame can id: {:?}", id);
+            trace!("frame can id: {:?}", FormattedCanId(frame_id));
             // create the return vec
             let mut tx_vec = Vec::new();
 
@@ -279,10 +305,13 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
         #[cfg(feature = "defmt")]
         debug!("queue multiple frames");
         #[cfg(feature = "defmt")]
-        trace!("canid:{:?}", frame_id);
+        trace!("canid:{:?}", FormattedCanId(frame_id));
 
         let txf_desc = match self.txf_map.get_mut(&txf_key) {
             Some(t) => Ok::<&mut TransferDesc, E>(t),
+            #[cfg(feature = "defmt")]
+            None => defmt::panic!(),
+            #[cfg(not(feature = "defmt"))]
             None => panic!(),
         }?;
 
@@ -413,6 +442,9 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
         }
         let txf_desc = match self.txf_map.get_mut(&txf_key) {
             Some(t) => Ok::<&mut TransferDesc, E>(t),
+            #[cfg(feature = "defmt")]
+            None => defmt::panic!(),
+            #[cfg(not(feature = "defmt"))]
             None => panic!(),
         }?;
         #[cfg(feature = "defmt")]

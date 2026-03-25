@@ -54,9 +54,8 @@ impl<const BROADCAST_PAYLOAD_SIZE_MAX: usize> BroadcastMessage<BROADCAST_PAYLOAD
 /// Trait for application specific frame handler
 /// This allows different handlers for different Uavcan frame types
 /// The main categories of frame types, are Services, Messages, and Anonymous Messages
-pub trait UavcanHandler<CAN, FRAME, E, const BROADCAST_PAYLOAD_SIZE_MAX: usize>
+pub trait UavcanHandler<FRAME, E, const BROADCAST_PAYLOAD_SIZE_MAX: usize>
 where
-    CAN: embedded_can::nb::Can<Frame = FRAME, Error = E>,
     FRAME: embedded_can::Frame,
     E: embedded_can::Error,
 {
@@ -66,7 +65,6 @@ where
         node_id: u8,
         payload: &RxPayload,
         can_id: &CanId,
-        interface: &mut UavcanInterface<CAN>,
     ) -> Result<Option<Vec<BroadcastMessage<BROADCAST_PAYLOAD_SIZE_MAX>, 10>>, CanError<E>>;
 }
 
@@ -131,18 +129,17 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
     /// handler.  If the frame is not a data frame, or doesn't have an
     /// extended id, it is ignored. If the frame is a service request
     /// or response for different node id, it is ignored.
-    pub fn handle_rx_frame<CAN, FRAME, E, FH, const BROADCAST_PAYLOAD_SIZE_MAX: usize>(
+    pub fn handle_rx_frame<FRAME, E, FH, const BROADCAST_PAYLOAD_SIZE_MAX: usize>(
         &mut self,
-        iface: &mut UavcanInterface<CAN>,
+        interface_id: usize,
         frame: &FRAME,
         ts: &u64,
         handler: Option<&FH>,
     ) -> Result<Option<Vec<BroadcastMessage<BROADCAST_PAYLOAD_SIZE_MAX>, 10>>, CanError<E>>
     where
-        CAN: embedded_can::nb::Can<Frame = FRAME, Error = E>,
         FRAME: embedded_can::Frame,
         E: embedded_can::Error,
-        FH: UavcanHandler<CAN, FRAME, E, BROADCAST_PAYLOAD_SIZE_MAX>,
+        FH: UavcanHandler<FRAME, E, BROADCAST_PAYLOAD_SIZE_MAX>,
     {
         // get the CanId, ignore non-extended CAN id's
         let can_id = match frame.id() {
@@ -166,10 +163,10 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
                 }
             }
             // otherwise, process the data frame
-            if let Some(rx_payload) = self._handle_rx_frame(iface, &can_id, frame, ts)? {
+            if let Some(rx_payload) = self._handle_rx_frame(interface_id, &can_id, frame, ts)? {
                 // got a completed transfer, pass to handler
                 if let Some(handler) = handler {
-                    let msgs = handler.handle_message(self.node_id, &rx_payload, &can_id, iface)?;
+                    let msgs = handler.handle_message(self.node_id, &rx_payload, &can_id)?;
                     return Ok(msgs);
                 }
             }
@@ -411,15 +408,14 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
     /// Panics
     ///
     /// see algorithm at [The DroneCAN spec, transport layer page](https://dronecan.github.io/Specification/4._CAN_bus_transport_layer/)
-    fn _handle_rx_frame<CAN, FRAME, E>(
+    fn _handle_rx_frame<FRAME, E>(
         &mut self,
-        iface: &mut UavcanInterface<CAN>,
+        interface_id: usize,
         can_id: &CanId,
         frame: &FRAME,
         frame_ts: &u64,
     ) -> Result<Option<RxPayload>, CanError<E>>
     where
-        CAN: embedded_can::nb::Can<Frame = FRAME, Error = E>,
         FRAME: embedded_can::Frame,
         E: embedded_can::Error,
     {
@@ -453,7 +449,7 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
         // update state flags for restart check
         let tid_timed_out = (frame_ts - txf_desc.ts()) > self.transfer_timeout;
         let iface_switch_allowed = (frame_ts - txf_desc.ts()) > self.interface_switch_delay;
-        let same_iface = iface.index() == txf_desc.index();
+        let same_iface = interface_id == txf_desc.index();
         let non_wrapped_tid =
             TransferDesc::compute_forward_distance(txf_desc.transfer_id(), tail_byte.transfer_id)
                 < TransferDesc::TRANSFER_ID_HALF_RANGE;
@@ -481,7 +477,7 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
             debug!("needs a restart from txfid:{}", txf_desc.transfer_id());
             // needs a restart
             self.initialized = true;
-            txf_desc.restart(iface.index(), tail_byte.transfer_id);
+            txf_desc.restart(interface_id, tail_byte.transfer_id);
             // ignore this frame, if start of transfer was missed
             if !tail_byte.start_of_transfer {
                 txf_desc.transfer_id_incr();
@@ -489,7 +485,7 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
             }
         }
 
-        if iface.index() != txf_desc.index() {
+        if interface_id != txf_desc.index() {
             #[cfg(feature = "defmt")]
             trace!("wrong interface");
             // wrong interface, ignore
@@ -508,7 +504,7 @@ impl<const TXQUEUELEN: usize, const TXFMAPLEN: usize> Uavcan<TXQUEUELEN, TXFMAPL
             return Ok(None);
         }
         if tail_byte.start_of_transfer {
-            txf_desc.start(frame_ts, iface.index());
+            txf_desc.start(frame_ts, interface_id);
         }
 
         // update the toggle bit
@@ -673,13 +669,12 @@ mod test {
         }
     }
 
-    impl UavcanHandler<MockCan, MockFrame, Infallible, 72> for MockHandler {
+    impl UavcanHandler<MockFrame, Infallible, 72> for MockHandler {
         fn handle_message(
             &self,
             _node_id: u8,
             payload: &RxPayload,
             _can_id: &CanId,
-            _interface: &mut UavcanInterface<MockCan>,
         ) -> Result<Option<Vec<BroadcastMessage, 10>>, CanError<Infallible>> {
             let idx = *self.index.borrow();
             assert_eq!(*payload, self.expected[idx]);
@@ -822,28 +817,28 @@ mod test {
 
         // now get 6 frames, first is (2) 7 byte messages, followed by (2) messages of 8 bytes
         let frame = intf.receive().unwrap();
-        uav.handle_rx_frame(&mut intf, &frame, &10, Some(&handler))
+        uav.handle_rx_frame(intf.index(), &frame, &10, Some(&handler))
             .unwrap();
 
         let frame = intf.receive().unwrap();
-        uav.handle_rx_frame(&mut intf, &frame, &20, Some(&handler))
+        uav.handle_rx_frame(intf.index(), &frame, &20, Some(&handler))
             .unwrap();
 
         // the multi frame messages now
         let frame = intf.receive().unwrap();
-        uav.handle_rx_frame(&mut intf, &frame, &40, Some(&handler))
+        uav.handle_rx_frame(intf.index(), &frame, &40, Some(&handler))
             .unwrap();
 
         let frame = intf.receive().unwrap();
-        uav.handle_rx_frame(&mut intf, &frame, &45, Some(&handler))
+        uav.handle_rx_frame(intf.index(), &frame, &45, Some(&handler))
             .unwrap();
 
         let frame = intf.receive().unwrap();
-        uav.handle_rx_frame(&mut intf, &frame, &50, Some(&handler))
+        uav.handle_rx_frame(intf.index(), &frame, &50, Some(&handler))
             .unwrap();
 
         let frame = intf.receive().unwrap();
-        uav.handle_rx_frame(&mut intf, &frame, &55, Some(&handler))
+        uav.handle_rx_frame(intf.index(), &frame, &55, Some(&handler))
             .unwrap();
     }
 }

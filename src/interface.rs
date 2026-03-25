@@ -204,6 +204,11 @@ where
         }
         Ok(())
     }
+
+    /// Give up the CAN interface, and return the index
+    pub fn release(self) -> (CAN, usize) {
+        (self.iface, self.n)
+    }
 }
 
 impl<CAN, FRAME, E> core::ops::Deref for UavcanInterface<CAN>

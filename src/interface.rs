@@ -196,10 +196,11 @@ where
     /// Transmit a set of frames, blocking
     pub fn send(&mut self, frames: Vec<FRAME, 10>) -> Result<(), CanError<E>> {
         for f in frames {
-            match nb::block!(self.iface.transmit(&f))? {
-                // TODO: we could get a lower priority frame, need to resend it
-                Some(_lower_priority_frame) => {}
-                None => {}
+            if let Some(lower_priority_frame) = nb::block!(self.iface.transmit(&f))? {
+                // we could get a lower priority frame returned to us, need to resend it
+                if nb::block!(self.iface.transmit(&lower_priority_frame))?.is_some() {
+                    panic!("couldn't txmit lower priority frame");
+                }
             }
         }
         Ok(())

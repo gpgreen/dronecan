@@ -1,7 +1,7 @@
 use crate::{
     CanError, DATA_FRAME_MAX_LEN_LEGACY, RxPayload,
     crc::TransferCrc,
-    interface::{TransferDesc, TransferDescKey, UavcanInterface},
+    interface::{TransferDesc, TransferDescKey},
     messages::MsgType,
     protocol::{CanId, FrameType, RequestResponse, TailByte, TransferComponent},
 };
